@@ -1,0 +1,11 @@
+{
+  "id": "obsidaiantoima",
+  "name": "Obsidian IMA Sync",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Sync Obsidian notes to IMA knowledge base for AI-powered search and Q&A",
+  "author": "zhonxia",
+  "authorUrl": "https://github.com/zhonxia",
+  "fundingUrl": "",
+  "isDesktopOnly": true
+}
