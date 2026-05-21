@@ -13,37 +13,58 @@ English | [中文](#中文)
 
 **Obsidian** is where your ideas live. Plain markdown, local files, yours forever.
 
-**IMA** (Tencent's AI knowledge base) is where AI meets your knowledge. Powerful retrieval, intelligent Q&A, automated organization.
+**IMA** is where AI meets your knowledge. But it's more than Q&A — IMA is a **vector knowledge base platform** with production-grade semantic search and a **Skill system** that lets you build custom AI agents on top of your data.
 
-But they don't talk to each other.
+The problem? They don't talk to each other.
 
-**Obsidian IMA Sync** is the bridge. Write in Obsidian (your data stays yours), sync to IMA (AI does the heavy lifting). No local vector database, no GPU required — just your notes, with superpowers.
+**Obsidian IMA Sync** bridges them. Write in Obsidian, sync to IMA's vector knowledge base, then build whatever AI workflow you need on top.
 
 ---
 
-## Why This Exists
+## Why Cloud Vector Search (Not Local)
 
-| Problem | Solution |
-|---------|----------|
-| Local vector search is slow and inaccurate | IMA's cloud-grade AI delivers precise answers |
-| Your laptop can't run large models | Zero local compute — all AI runs on IMA's servers |
-| IMA has no good editor | Obsidian is the best markdown editor. Keep writing here |
-| Obsidian has no built-in AI knowledge base | Your notes become an AI-searchable knowledge base |
-| You want your data portable | Notes stay in Obsidian as plain markdown. No lock-in |
+This is the core question. Why not just run embeddings locally?
+
+Because **vector search quality is the bottleneck** — and local solutions fundamentally can't match cloud infrastructure:
+
+| Local Vector Search | IMA Cloud Vector Search |
+|---------------------|------------------------|
+| Tiny embedding models (384d) | Production-grade models (768d+) |
+| Dense vector only — no keyword hybrid | Hybrid search: dense + sparse + keyword |
+| No reranking | Full reranking pipeline for precision |
+| Fixed model, never improves | Model continuously upgraded |
+| Single-machine index, no scale | Distributed vector database, billions scale |
+| No skill ecosystem | **IMA Skills** — build custom AI agents on your KB |
+
+**This isn't about cloud vs local. It's about capable vs limited.**  
+A local vector DB can't rerank, can't hybrid search, can't improve over time. IMA can — because it's built on Tencent's production infrastructure, not a laptop.
+
+---
+
+## Beyond Sync: IMA Skills
+
+Syncing notes to IMA unlocks more than search. IMA's **Skill system** lets you build custom AI agents that operate on your knowledge base:
+
+- **Research Agent** — Ask deep questions across your entire library
+- **Daily Briefing** — AI summarizes what you wrote recently
+- **Note Connector** — Find implicit connections between notes
+- **Custom Skill** — Use IMA's OpenAPI to build your own
+
+Your Obsidian notes become **a platform** for AI workflows, not just a search index.
 
 ---
 
 ## How It Works
 
 ```
-You write in Obsidian ──→ Sync to IMA ──→ AI search & Q&A
-       │                         │
-  Your .md files           IMA knowledge base
-  Yours forever            AI-powered
-  No lock-in               Ask questions, get answers
+You write in Obsidian ──→ Sync to IMA ──→ Vector KB ──→ AI Skills & Agents
+       │                         │              │
+  Your .md files          IMA knowledge      Hybrid search
+  Yours forever            base               Dense + Sparse
+  No lock-in                                  + Reranking
 ```
 
-**Your data is yours.** Your notes remain in Obsidian as plain markdown files. IMA is a searchable copy — you can delete it anytime, your originals stay safe.
+**Your data is yours.** Notes stay in Obsidian as plain markdown. IMA is a searchable, agent-ready copy — delete it anytime, your originals remain.
 
 ---
 
@@ -101,7 +122,7 @@ npm install && npm run build
 
 - **First sync** → `import_doc` creates a new IMA note + optionally adds to knowledge base
 - **Subsequent syncs** → `append_doc` appends a timestamped update with full latest content
-- Why? IMA's API doesn't support in-place updates. The appended format preserves both history and the latest content for AI retrieval.
+- Why append? IMA's API doesn't support in-place updates. The appended format preserves history while keeping the latest content available for AI retrieval and Skills.
 
 ---
 
@@ -141,42 +162,59 @@ MIT
 
 ## 中文
 
-### 为什么你需要这个插件
+### 核心理念
 
-**Obsidian** 是最好的笔记工具之一。纯 Markdown、本地存储、数据属于你 —— 但它的知识检索能力有限。
+> **你的数据就是你的。云端能力，本地主权。**
 
-**IMA**（腾讯智能知识库）有强大的 AI 能力 —— 精准检索、智能问答、Copilot 自动整理 —— 但它没有一个好的编辑器。
+笔记永远在 Obsidian 里，纯 Markdown，随时可迁移。IMA 是检索和 AI 加工的副本，源文件由你掌控。
 
-**Obsidian IMA Sync** 让两者各司其职：
+### 为什么不用本地向量知识库？
 
-> **Obsidian 负责写，IMA 负责 AI。你的数据始终是你的。**
+这是最根本的问题。本地跑 embedding 看起来很美好，但**向量检索的质量是瓶颈**——本地方案在根本上就无法匹敌云端基础设施：
+
+| 本地方案 | IMA 云端 |
+|---------|----------|
+| 小模型 (384维) | 生产级模型 (768维+) |
+| 纯稠密向量，无混合检索 | 混合检索：稠密 + 稀疏 + 关键词 |
+| 无重排序 (reranking) | 完整重排序 pipeline |
+| 固定模型，永不升级 | 模型持续迭代优化 |
+| 单机索引，无法扩展 | 分布式向量数据库，亿级规模 |
+| 没有技能生态 | **IMA Skill 系统** — 在知识库上构建自定义 AI Agent |
+
+**这不是"云端 vs 本地"的选择，而是"有能力 vs 没能力"的选择。**  
+本地向量库不能 rerank、不能混合搜索、不能随时间变好。IMA 可以——因为它跑在腾讯的生产基础设施上，而不是你的笔记本上。
+
+### IMA Skill：不只是检索，是智能体平台
+
+笔记同步到 IMA 后，你得到的不只是一个可搜索的知识库，而是一个**能运行 AI Agent 的平台**。IMA 的 Skill 系统让你在知识库上构建各种 AI 工作流：
+
+- 🔬 **调研助手** — 跨整库深度研究，自动整理文献综述
+- 📋 **日报生成** — AI 自动总结你最近写了什么
+- 🔗 **笔记关联器** — 发现笔记之间的隐性连接，构建知识图谱
+- 🛠️ **自定义 Skill** — 通过 IMA OpenAPI 构建你自己的 AI Agent
+
+你的 Obsidian 笔记不再只是笔记——它们是 **AI 工作流的原材料**，IMA 是加工厂。
+
+### IMA Copilot 能力
+
+- ✨ **自动整理** — AI 帮你分类、归纳、打标签
+- 🔍 **精准检索** — 自然语言提问，混合搜索 + reranking 保证精度
+- 💬 **智能问答** — 基于你的知识库回答，上下文相关
+- 🌐 **知识图谱** — 自动构建笔记之间的语义关联
 
 ### 解决的问题
 
 | 问题 | 解法 |
 |------|------|
-| 本地向量知识库检索不准 | IMA 云端 AI，检索和问答准确度高 |
-| 电脑带不动大模型 | 不需要本地 GPU，AI 全部跑在云端 |
-| IMA 没有好用的编辑器 | Obsidian 写笔记，IMA 消费内容，两不耽误 |
-| Obsidian 没有 AI 知识库 | 笔记同步到 IMA，直接 AI 检索和问答 |
+| 本地向量检索不准 (无 rerank、无混合搜索) | IMA 生产级检索 pipeline |
+| 电脑带不动大模型 | 不需要本地 GPU，全部云端 |
+| IMA 没有好用的编辑器 | Obsidian 写，IMA 消费，两不耽误 |
+| Obsidian 没有 AI 能力 | 笔记同步后，直接获得整个 IMA Skill 生态 |
 | 数据被锁定 | 笔记永远是 Obsidian 的 .md 文件，随时可迁移 |
 
-### 核心理念
+### 一句话总结
 
-**你的数据就是你的。**
-
-- 笔记永远在 Obsidian 里，以纯 Markdown 格式存在
-- IMA 是可检索的副本，随时可以删除，源文件不受影响
-- 双向隔离，但一键连通：Obsidian 负责创作，IMA 负责 AI
-
-### IMA Copilot 的增值能力
-
-笔记同步到 IMA 后，你可以利用 **IMA Copilot** 实现：
-
-- ✨ **自动整理** — AI 帮你分类、归纳笔记
-- 🔍 **深度检索** — 自然语言提问，精准定位内容
-- 💬 **智能问答** — 基于你的知识库，AI 给出上下文相关回答
-- 📊 **知识图谱** — IMA 自动构建笔记之间的关联
+> **你的数据在你手里，AI 能力在云端。Obsidian IMA Sync 是那座桥。**
 
 ### 安装
 
@@ -214,7 +252,7 @@ npm install && npm run build
 
 - **首次同步** — `import_doc` 在 IMA 创建一条新笔记，可选添加到知识库
 - **增量同步** — `append_doc` 在 IMA 笔记末尾追加带时间戳的最新完整内容
-- **为什么是追加？** IMA API 不支持原地更新。追加格式保留了变更历史，同时 AI 检索时能读到最新内容
+- **为什么追加？** IMA API 不支持原地更新。追加格式保留了变更历史，同时 AI 检索和 Skill 能读到最新内容
 
 ### 开发
 
