@@ -30,33 +30,29 @@ export class SyncEngine {
   private metadataCache: MetadataCache;
   private settings: ObsidianToIMASettings;
   private data: PluginData;
-  private saveDataFn: (data: PluginData) => Promise<void>;
-  private loadDataFn: () => Promise<PluginData | undefined>;
+  private persistFn: () => Promise<void>;
 
   constructor(
     api: ImaApi,
     vault: Vault,
     metadataCache: MetadataCache,
     settings: ObsidianToIMASettings,
-    saveDataFn: (data: PluginData) => Promise<void>,
-    loadDataFn: () => Promise<PluginData | undefined>
+    persistFn: () => Promise<void>
   ) {
     this.api = api;
     this.vault = vault;
     this.metadataCache = metadataCache;
     this.settings = settings;
-    this.saveDataFn = saveDataFn;
-    this.loadDataFn = loadDataFn;
+    this.persistFn = persistFn;
     this.data = { syncedNotes: {} };
   }
 
-  async loadData(): Promise<void> {
-    const raw = await this.loadDataFn();
-    this.data = raw || { syncedNotes: {} };
+  setSyncData(syncedNotes: Record<string, SyncRecord>): void {
+    this.data.syncedNotes = syncedNotes;
   }
 
-  async saveData(): Promise<void> {
-    await this.saveDataFn(this.data);
+  getSyncData(): Record<string, SyncRecord> {
+    return this.data.syncedNotes;
   }
 
   updateSettings(settings: ObsidianToIMASettings): void {
@@ -152,7 +148,7 @@ export class SyncEngine {
         };
       }
 
-      await this.saveData();
+      await this.persistFn();
       onProgress?.(1, 1, file.path);
       return { path: file.path, status: "synced", record: this.data.syncedNotes[file.path] };
     } catch (err) {
@@ -201,6 +197,6 @@ export class SyncEngine {
 
   removeRecord(path: string): void {
     delete this.data.syncedNotes[path];
-    this.saveData();
+    this.persistFn();
   }
 }

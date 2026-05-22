@@ -1,7 +1,7 @@
 import { Plugin, TFile, Notice, addIcon } from "obsidian";
 import { ImaApi } from "./api";
 import { ObsidianToIMASettings, DEFAULT_SETTINGS, SettingsTab } from "./settings";
-import { SyncEngine } from "./sync";
+import { SyncEngine, type SyncRecord } from "./sync";
 import { ImaSyncView, VIEW_TYPE } from "./view";
 
 const UPLOAD_ICON = `<svg viewBox="0 0 100 100" width="100" height="100">
@@ -9,13 +9,18 @@ const UPLOAD_ICON = `<svg viewBox="0 0 100 100" width="100" height="100">
   <rect x="10" y="70" width="80" height="15" rx="3" fill="currentColor"/>
 </svg>`;
 
+interface PersistedData {
+  settings?: ObsidianToIMASettings;
+  syncedNotes?: Record<string, SyncRecord>;
+}
+
 export default class ObsidianToIMAPlugin extends Plugin {
   settings: ObsidianToIMASettings = DEFAULT_SETTINGS;
   private api!: ImaApi;
   private syncEngine!: SyncEngine;
 
   async onload(): Promise<void> {
-    await this.loadSettings();
+    await this.loadAllData();
     this.api = new ImaApi({
       clientId: this.settings.clientId,
       apiKey: this.settings.apiKey,
@@ -26,10 +31,9 @@ export default class ObsidianToIMAPlugin extends Plugin {
       this.app.vault,
       this.app.metadataCache,
       this.settings,
-      (data) => this.saveData(data),
-      () => this.loadData()
+      () => this.persistAll()
     );
-    await this.syncEngine.loadData();
+    this.syncEngine.setSyncData(this._syncedNotes);
 
     this.registerView(VIEW_TYPE, (leaf) => {
       return new ImaSyncView(leaf, {
@@ -150,13 +154,28 @@ export default class ObsidianToIMAPlugin extends Plugin {
     return this.api.listKnowledgeBases();
   }
 
-  async loadSettings(): Promise<void> {
-    const data = await this.loadData();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+  private _syncedNotes: Record<string, SyncRecord> = {};
+
+  async loadAllData(): Promise<void> {
+    const data = await this.loadData() as PersistedData | undefined;
+    if (data?.settings) {
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
+    }
+    if (data?.syncedNotes) {
+      this._syncedNotes = data.syncedNotes;
+    }
+  }
+
+  async persistAll(): Promise<void> {
+    const data: PersistedData = {
+      settings: this.settings,
+      syncedNotes: this.syncEngine?.getSyncData() || this._syncedNotes,
+    };
+    await this.saveData(data);
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    await this.persistAll();
     if (this.api) {
       this.api.updateConfig({
         clientId: this.settings.clientId,
@@ -173,7 +192,7 @@ export default class ObsidianToIMAPlugin extends Plugin {
 
     let leaf = workspace.getLeavesOfType(VIEW_TYPE).first();
     if (!leaf) {
-      leaf = workspace.getRightLeaf(false);
+      leaf = workspace.getRightLeaf(false) ?? undefined;
       if (!leaf) return;
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
