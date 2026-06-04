@@ -100,7 +100,7 @@ var State = class {
     this.notebookId = "";
     this.rootHpath = "/inbox";
     this.folders = [];
-    this.writeBackIAL = true;
+    this.writeBackIAL = false;
     this.importOnChange = true;
     this.bidirectional = true;
     this.mappings = {};
@@ -112,7 +112,7 @@ var State = class {
         this.notebookId = raw.notebookId || "";
         this.rootHpath = raw.rootHpath || "/inbox";
         this.folders = raw.folders || [];
-        this.writeBackIAL = raw.writeBackIAL !== false;
+        this.writeBackIAL = raw.writeBackIAL === true;
         this.importOnChange = raw.importOnChange !== false;
         this.bidirectional = raw.bidirectional !== false;
         this.mappings = raw.mappings || {};
@@ -178,7 +178,7 @@ var messages = {
     rootHpath: "\u76EE\u6807 HPath\uFF08\u7B14\u8BB0\u672C\u5185\u7684\u6839\u8DEF\u5F84\uFF09",
     rootHpathHint: "\u4F8B\u5982\u586B /inbox\uFF1B\u76D1\u542C\u6587\u4EF6\u5939\u91CC\u7684 foo/bar.md \u4F1A\u53D8\u6210 /inbox/foo/bar",
     writeBackIAL: "\u5C06\u601D\u6E90\u751F\u6210\u7684 IAL \u5757 ID \u5199\u56DE .md \u6E90\u6587\u4EF6",
-    writeBackIALHint: "\u5173\u95ED\u540E .md \u4FDD\u6301\u5E72\u51C0\uFF0C\u4F46\u5757\u5F15\u7528 ((xxx)) \u4F1A\u5931\u6548",
+    writeBackIALHint: "\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF09\u540E .md \u4FDD\u6301\u5E72\u51C0\uFF0C\u5757\u5F15\u7528 ((xxx)) \u4F1A\u5931\u6548",
     bidirectional: "\u53CC\u5411\u540C\u6B65\uFF1A\u601D\u6E90\u91CC\u4FEE\u6539\u4E5F\u81EA\u52A8\u5199\u56DE .md",
     bidirectionalHint: '\u5173\u95ED\u540E\u53EA\u80FD\u4ECE .md \u63A8\u5230\u601D\u6E90\uFF0C\u601D\u6E90\u91CC\u6539\u4E86\u9700\u8981\u624B\u52A8"\u5BFC\u51FA\u5F53\u524D\u6587\u6863"',
     importOnChange: "\u6587\u4EF6\u6539\u52A8\u65F6\u81EA\u52A8\u5BFC\u5165",
@@ -188,6 +188,8 @@ var messages = {
     cmdReconcile: "\u7ACB\u5373\u5BF9\u8D26\uFF08\u626B\u4E00\u904D\u6240\u6709\u76D1\u542C\u6587\u4EF6\u5939\uFF09",
     cmdForcePull: "\u4ECE\u601D\u6E90\u62C9\u53D6\u6240\u6709\u6620\u5C04\u6587\u6863\u5230 .md\uFF08\u8C03\u8BD5\uFF09",
     forcePullDone: "\u5DF2\u62C9\u53D6",
+    cmdCleanIal: "\u6E05\u7406\u6240\u6709 .md \u91CC\u7684 IAL \u5757 ID \u566A\u97F3",
+    cleanIalDone: "\u5DF2\u6E05\u7406",
     importing: "\u6B63\u5728\u5BFC\u5165...",
     imported: "\u5DF2\u5BFC\u5165",
     exported: "\u5DF2\u5BFC\u51FA",
@@ -233,6 +235,8 @@ var messages = {
     cmdReconcile: "Reconcile now (scan all watched folders)",
     cmdForcePull: "Force pull all mapped docs from Siyuan (debug)",
     forcePullDone: "pulled",
+    cmdCleanIal: "Strip IAL block IDs from all .md files",
+    cleanIalDone: "cleaned",
     importing: "Importing...",
     imported: "Imported",
     exported: "Exported",
@@ -261,6 +265,12 @@ var t = (key) => {
 
 // src/sync.js
 var sha256 = (text) => import_crypto.default.createHash("sha256").update(text).digest("hex");
+function stripIal(text) {
+  let out = text.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "");
+  out = out.replace(/\n{3,}/g, "\n\n");
+  out = out.replace(/\s+$/, "");
+  return out;
+}
 function relToRoot(absPath, folders) {
   for (const f of folders) {
     if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) {
@@ -334,13 +344,15 @@ var Sync = class {
       if (!newId) throw new Error("createDocWithMd \u672A\u8FD4\u56DE id");
       const syContent = await this.api.getDocKramdown(newId);
       const syHash = sha256(syContent);
+      let fileOnDiskHash = h;
       if (this.state.writeBackIAL && syContent !== content) {
         await import_promises.default.writeFile(absPath, syContent, "utf-8");
+        fileOnDiskHash = syHash;
       }
       this.state.set(absPath, {
         docId: newId,
         hpath,
-        mdHash: this.state.writeBackIAL ? syHash : h,
+        mdHash: fileOnDiskHash,
         syHash
       });
       this.state.save();
@@ -502,14 +514,15 @@ var Sync = class {
       this.log("[pull] getDocKramdown \u5931\u8D25", docId, e.message);
       return;
     }
-    const newHash = sha256(kramdown);
+    const cleaned = stripIal(kramdown);
+    const cleanedHash = sha256(cleaned);
     const existing = this.state.get(mapping.path);
-    if (existing && existing.syHash === newHash) {
-      this.log("[pull] syHash \u4E00\u81F4\uFF0C\u65E0\u9700\u5199\u56DE:", mapping.path);
+    if (existing && existing.syHash === cleanedHash) {
+      this.log("[pull] \u5185\u5BB9\u672A\u53D8\uFF0C\u8DF3\u8FC7:", mapping.path);
       return;
     }
     try {
-      await import_promises.default.writeFile(mapping.path, kramdown, "utf-8");
+      await import_promises.default.writeFile(mapping.path, cleaned, "utf-8");
     } catch (e) {
       this.log("[pull] writeFile \u5931\u8D25", mapping.path, e.message);
       return;
@@ -518,8 +531,8 @@ var Sync = class {
       ...existing,
       docId,
       hpath: existing?.hpath || "",
-      mdHash: newHash,
-      syHash: newHash
+      mdHash: cleanedHash,
+      syHash: cleanedHash
     });
     await this.state.save();
     this.log("[pull] OK", mapping.path, "\u2190", docId);
@@ -735,6 +748,31 @@ function registerCommands(plugin) {
       (0, import_siyuan4.showMessage)(`${t("forcePullDone")}: ${n}`, 2e3);
     }
   });
+  plugin.addCommand({
+    langKey: "cmdCleanIal",
+    hotkey: "",
+    callback: async () => {
+      const fs3 = require("fs/promises");
+      const crypto2 = require("crypto");
+      const sha = (t2) => crypto2.createHash("sha256").update(t2).digest("hex");
+      const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
+      let n = 0;
+      for (const [absPath, info] of Object.entries(state.mappings || {})) {
+        try {
+          const orig = await fs3.readFile(absPath, "utf-8");
+          const cleaned = strip(orig);
+          if (cleaned !== orig) {
+            await fs3.writeFile(absPath, cleaned, "utf-8");
+            state.set(absPath, { ...info, mdHash: sha(cleaned) });
+            n++;
+          }
+        } catch (e) {
+        }
+      }
+      await state.save();
+      (0, import_siyuan4.showMessage)(`${t("cleanIalDone")}: ${n}`, 2e3);
+    }
+  });
 }
 
 // src/index.js
@@ -805,6 +843,30 @@ var index_default = class extends import_siyuan5.Plugin {
         this.notify(t("pluginLoaded"));
       }
       this.log("plugin loaded");
+      if (typeof window !== "undefined") {
+        window.__mdSync = {
+          plugin: this,
+          sync: this.sync,
+          state: this.state,
+          api: this.api,
+          forcePull: (docId) => this.sync.pullFromSiyuan(docId),
+          forcePullAll: async () => {
+            const ids = Object.values(this.state.mappings || {}).map((m) => m.docId).filter(Boolean);
+            const results = [];
+            for (const id of ids) {
+              try {
+                await this.sync.pullFromSiyuan(id);
+                results.push({ id, ok: true });
+              } catch (e) {
+                results.push({ id, ok: false, err: e.message });
+              }
+            }
+            return results;
+          },
+          simulateWsEvent: (docId) => this.sync.schedulePull(docId)
+        };
+        this.log("window.__mdSync ready (debug)");
+      }
     } catch (e) {
       this.log("load failed", e);
       (0, import_siyuan5.showMessage)(`${t("error")}: ${e.message}`, 5e3, "error");

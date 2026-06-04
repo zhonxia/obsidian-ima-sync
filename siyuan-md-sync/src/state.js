@@ -6,7 +6,7 @@ export class State {
     this.notebookId = '';
     this.rootHpath = '/inbox';
     this.folders = [];
-    this.writeBackIAL = true;
+    this.writeBackIAL = false;
     this.importOnChange = true;
     this.bidirectional = true;
     this.mappings = {};
@@ -19,7 +19,7 @@ export class State {
         this.notebookId = raw.notebookId || '';
         this.rootHpath = raw.rootHpath || '/inbox';
         this.folders = raw.folders || [];
-        this.writeBackIAL = raw.writeBackIAL !== false;
+        this.writeBackIAL = raw.writeBackIAL === true;
         this.importOnChange = raw.importOnChange !== false;
         this.bidirectional = raw.bidirectional !== false;
         this.mappings = raw.mappings || {};

@@ -104,4 +104,29 @@ export function registerCommands(plugin) {
       showMessage(`${t('forcePullDone')}: ${n}`, 2000);
     },
   });
+
+  plugin.addCommand({
+    langKey: 'cmdCleanIal',
+    hotkey: '',
+    callback: async () => {
+      const fs = require('fs/promises');
+      const crypto = require('crypto');
+      const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
+      const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
+      let n = 0;
+      for (const [absPath, info] of Object.entries(state.mappings || {})) {
+        try {
+          const orig = await fs.readFile(absPath, 'utf-8');
+          const cleaned = strip(orig);
+          if (cleaned !== orig) {
+            await fs.writeFile(absPath, cleaned, 'utf-8');
+            state.set(absPath, { ...info, mdHash: sha(cleaned) });
+            n++;
+          }
+        } catch (e) { /* 文件可能被删了 */ }
+      }
+      await state.save();
+      showMessage(`${t('cleanIalDone')}: ${n}`, 2000);
+    },
+  });
 }

@@ -16,6 +16,21 @@ import { t } from './i18n.js';
 
 const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
 
+/**
+ * 把思源 kramdown 里的 IAL 行剥掉，让 .md 干净可读。
+ * IAL 形如 `{: id="20240101-abc1234" updated="20240101"}`，
+ * 总是独占一行（块级），doc 末尾的那行 `{: ... type="doc" ...}` 也一样。
+ */
+function stripIal(text) {
+  // 删掉 IAL 行本身
+  let out = text.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '');
+  // 删掉连续空行（避免留下两个换行）
+  out = out.replace(/\n{3,}/g, '\n\n');
+  // 去尾部多余空白
+  out = out.replace(/\s+$/, '');
+  return out;
+}
+
 /** 文件路径（绝对）→ 在 HPath root 下的相对路径。返回 null 表示不在任何监听目录下。 */
 function relToRoot(absPath, folders) {
   for (const f of folders) {
@@ -110,14 +125,16 @@ export class Sync {
       const syHash = sha256(syContent);
 
       // 可选：把 IAL 写回源文件（让 .md 包含 {: id="..."}）
+      let fileOnDiskHash = h;
       if (this.state.writeBackIAL && syContent !== content) {
         await fs.writeFile(absPath, syContent, 'utf-8');
+        fileOnDiskHash = syHash;
       }
 
       this.state.set(absPath, {
         docId: newId,
         hpath,
-        mdHash: this.state.writeBackIAL ? syHash : h,
+        mdHash: fileOnDiskHash,
         syHash,
       });
       this.state.save();
@@ -282,14 +299,16 @@ export class Sync {
       this.log('[pull] getDocKramdown 失败', docId, e.message);
       return;
     }
-    const newHash = sha256(kramdown);
+    // 剥掉 IAL 块 ID 行（`{: id="..." ...}`），让 .md 文件保持干净
+    const cleaned = stripIal(kramdown);
+    const cleanedHash = sha256(cleaned);
     const existing = this.state.get(mapping.path);
-    if (existing && existing.syHash === newHash) {
-      this.log('[pull] syHash 一致，无需写回:', mapping.path);
+    if (existing && existing.syHash === cleanedHash) {
+      this.log('[pull] 内容未变，跳过:', mapping.path);
       return;
     }
     try {
-      await fs.writeFile(mapping.path, kramdown, 'utf-8');
+      await fs.writeFile(mapping.path, cleaned, 'utf-8');
     } catch (e) {
       this.log('[pull] writeFile 失败', mapping.path, e.message);
       return;
@@ -298,8 +317,8 @@ export class Sync {
       ...existing,
       docId,
       hpath: existing?.hpath || '',
-      mdHash: newHash,
-      syHash: newHash,
+      mdHash: cleanedHash,
+      syHash: cleanedHash,
     });
     await this.state.save();
     this.log('[pull] OK', mapping.path, '←', docId);
