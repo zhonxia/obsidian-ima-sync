@@ -44,6 +44,7 @@ export default class extends Plugin {
 
     try {
       this.api = new Api();
+      await this.api.initDataDir();
 
       this.state = new State(this);
       await this.state.load();
@@ -108,6 +109,7 @@ export default class extends Plugin {
           simulateWsEvent: (docId) => this.sync.schedulePull(docId),
           reconcile: () => this.sync.reconcile(),
           dump: () => ({
+            dataDir: this.api.getDataDir(),
             activeNotebookId: this.state.activeNotebookId,
             notebooks: this.state.notebooks,
             mappings: this.state.mappings,
