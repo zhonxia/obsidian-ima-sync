@@ -89,4 +89,19 @@ export function registerCommands(plugin) {
       showMessage(`${t('reconcileDone')}: ${n}`, 2000);
     },
   });
+
+  plugin.addCommand({
+    langKey: 'cmdForcePull',
+    hotkey: '',
+    callback: async () => {
+      let n = 0;
+      for (const info of Object.values(state.mappings || {})) {
+        if (info?.docId) {
+          await sync.pullFromSiyuan(info.docId);
+          n++;
+        }
+      }
+      showMessage(`${t('forcePullDone')}: ${n}`, 2000);
+    },
+  });
 }

@@ -83,6 +83,27 @@ export default class extends Plugin {
       }
 
       this.log('plugin loaded');
+
+      if (typeof window !== 'undefined') {
+        window.__mdSync = {
+          plugin: this,
+          sync: this.sync,
+          state: this.state,
+          api: this.api,
+          forcePull: (docId) => this.sync.pullFromSiyuan(docId),
+          forcePullAll: async () => {
+            const ids = Object.values(this.state.mappings || {}).map(m => m.docId).filter(Boolean);
+            const results = [];
+            for (const id of ids) {
+              try { await this.sync.pullFromSiyuan(id); results.push({ id, ok: true }); }
+              catch (e) { results.push({ id, ok: false, err: e.message }); }
+            }
+            return results;
+          },
+          simulateWsEvent: (docId) => this.sync.schedulePull(docId),
+        };
+        this.log('window.__mdSync ready (debug)');
+      }
     } catch (e) {
       this.log('load failed', e);
       showMessage(`${t('error')}: ${e.message}`, 5000, 'error');

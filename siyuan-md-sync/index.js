@@ -186,6 +186,8 @@ var messages = {
     cmdImportFolder: "\u5BFC\u5165 Markdown \u6587\u4EF6\u5939",
     cmdExportCurrent: "\u5C06\u5F53\u524D\u6587\u6863\u5BFC\u51FA\u4E3A .md",
     cmdReconcile: "\u7ACB\u5373\u5BF9\u8D26\uFF08\u626B\u4E00\u904D\u6240\u6709\u76D1\u542C\u6587\u4EF6\u5939\uFF09",
+    cmdForcePull: "\u4ECE\u601D\u6E90\u62C9\u53D6\u6240\u6709\u6620\u5C04\u6587\u6863\u5230 .md\uFF08\u8C03\u8BD5\uFF09",
+    forcePullDone: "\u5DF2\u62C9\u53D6",
     importing: "\u6B63\u5728\u5BFC\u5165...",
     imported: "\u5DF2\u5BFC\u5165",
     exported: "\u5DF2\u5BFC\u51FA",
@@ -229,6 +231,8 @@ var messages = {
     cmdImportFolder: "Import Markdown folder",
     cmdExportCurrent: "Export current document as .md",
     cmdReconcile: "Reconcile now (scan all watched folders)",
+    cmdForcePull: "Force pull all mapped docs from Siyuan (debug)",
+    forcePullDone: "pulled",
     importing: "Importing...",
     imported: "Imported",
     exported: "Exported",
@@ -715,6 +719,20 @@ function registerCommands(plugin) {
     callback: async () => {
       const n = await sync.reconcile();
       (0, import_siyuan4.showMessage)(`${t("reconcileDone")}: ${n}`, 2e3);
+    }
+  });
+  plugin.addCommand({
+    langKey: "cmdForcePull",
+    hotkey: "",
+    callback: async () => {
+      let n = 0;
+      for (const info of Object.values(state.mappings || {})) {
+        if (info?.docId) {
+          await sync.pullFromSiyuan(info.docId);
+          n++;
+        }
+      }
+      (0, import_siyuan4.showMessage)(`${t("forcePullDone")}: ${n}`, 2e3);
     }
   });
 }
