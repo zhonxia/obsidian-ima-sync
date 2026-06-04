@@ -260,10 +260,17 @@ export default class extends Plugin {
 
   _renderRootHpathInput() {
     const cfg = this.state.getActive();
-    this._hpathInput.value = cfg?.rootHpath || '/inbox';
+    // 空字符串合法：表示「直接存到笔记本根目录」。placeholder 提示用户。
+    this._hpathInput.value = cfg?.rootHpath || '';
+    this._hpathInput.placeholder = t('rootHpathPlaceholder');
     this._hpathInput.onchange = () => {
       const cur = this.state.ensureActive();
-      if (cur) cur.rootHpath = this._hpathInput.value || '/inbox';
+      if (cur) {
+        // 不强制默认值；空字符串 = 笔记本根目录
+        cur.rootHpath = this._hpathInput.value.trim();
+        this._hpathInput.value = cur.rootHpath;
+        this.state.save();
+      }
     };
   }
 

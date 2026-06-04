@@ -68,7 +68,7 @@ export class State {
     for (const nbId of used) {
       if (!this.notebooks[nbId]) {
         console.log('[state] recovering notebook config for', nbId.slice(0, 14) + '...');
-        this.notebooks[nbId] = { folders: [], rootHpath: '/inbox' };
+        this.notebooks[nbId] = { folders: [], rootHpath: '' };
       }
     }
   }
@@ -143,7 +143,7 @@ export class State {
   ensureActive() {
     if (!this.activeNotebookId) return null;
     if (!this.notebooks[this.activeNotebookId]) {
-      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: '/inbox' };
+      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: '' };
     }
     return this.notebooks[this.activeNotebookId];
   }
@@ -151,7 +151,7 @@ export class State {
   setActive(notebookId) {
     this.activeNotebookId = notebookId || '';
     if (this.activeNotebookId && !this.notebooks[this.activeNotebookId]) {
-      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: '/inbox' };
+      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: '' };
     }
   }
 
@@ -159,7 +159,7 @@ export class State {
   allWatched() {
     const out = [];
     for (const [nbId, cfg] of Object.entries(this.notebooks)) {
-      const rootHpath = cfg.rootHpath || '/inbox';
+      const rootHpath = cfg.rootHpath || '';
       for (const folder of cfg.folders || []) {
         out.push({ notebookId: nbId, folder, rootHpath });
       }

@@ -44,14 +44,20 @@ function relToRoot(absPath, folders) {
 
 function toHPath(rootHpath, rel) {
   const stem = rel.replace(/\.md$/i, '');
-  const root = rootHpath.endsWith('/') ? rootHpath.slice(0, -1) : rootHpath;
-  return root + '/' + stem;
+  // 空 / "/" 视为「笔记本根目录」
+  const r = (rootHpath || '').replace(/\/+$/, '');
+  return r ? `${r}/${stem}` : `/${stem}`;
 }
 
 function fromHPath(rootHpath, hpath) {
-  const root = rootHpath.endsWith('/') ? rootHpath.slice(0, -1) : rootHpath;
-  if (!hpath.startsWith(root + '/')) return null;
-  return hpath.slice(root.length + 1) + '.md';
+  const r = (rootHpath || '').replace(/\/+$/, '');
+  if (!r) {
+    // 根目录模式：剥掉开头的 /
+    if (!hpath.startsWith('/')) return null;
+    return hpath.slice(1) + '.md';
+  }
+  if (!hpath.startsWith(r + '/')) return null;
+  return hpath.slice(r.length + 1) + '.md';
 }
 
 export class Sync {

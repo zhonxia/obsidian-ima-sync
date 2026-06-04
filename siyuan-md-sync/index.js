@@ -147,7 +147,7 @@ var State = class {
     for (const nbId of used) {
       if (!this.notebooks[nbId]) {
         console.log("[state] recovering notebook config for", nbId.slice(0, 14) + "...");
-        this.notebooks[nbId] = { folders: [], rootHpath: "/inbox" };
+        this.notebooks[nbId] = { folders: [], rootHpath: "" };
       }
     }
   }
@@ -213,21 +213,21 @@ var State = class {
   ensureActive() {
     if (!this.activeNotebookId) return null;
     if (!this.notebooks[this.activeNotebookId]) {
-      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "/inbox" };
+      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "" };
     }
     return this.notebooks[this.activeNotebookId];
   }
   setActive(notebookId) {
     this.activeNotebookId = notebookId || "";
     if (this.activeNotebookId && !this.notebooks[this.activeNotebookId]) {
-      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "/inbox" };
+      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "" };
     }
   }
   /** 返回 [{notebookId, folder, rootHpath}, ...] 所有笔记本的所有监听文件夹。 */
   allWatched() {
     const out = [];
     for (const [nbId, cfg] of Object.entries(this.notebooks)) {
-      const rootHpath = cfg.rootHpath || "/inbox";
+      const rootHpath = cfg.rootHpath || "";
       for (const folder of cfg.folders || []) {
         out.push({ notebookId: nbId, folder, rootHpath });
       }
@@ -314,7 +314,8 @@ var messages = {
     targetNotebook: "\u76EE\u6807\u7B14\u8BB0\u672C",
     targetNotebookDesc: '\u4E0B\u9762\u7684"\u76D1\u542C\u6587\u4EF6\u5939"\u548C"\u76EE\u6807 HPath"\u90FD\u9488\u5BF9\u6B64\u7B14\u8BB0\u672C\u3002\u5207\u6362\u7B14\u8BB0\u672C \u2192 \u5207\u6362\u914D\u7F6E\u3002',
     rootHpath: "\u76EE\u6807 HPath\uFF08\u5F53\u524D\u7B14\u8BB0\u672C\u5185\u7684\u6839\u8DEF\u5F84\uFF09",
-    rootHpathHint: "\u4F8B\u5982\u586B /inbox\uFF1B\u76D1\u542C\u6587\u4EF6\u5939\u91CC\u7684 foo/bar.md \u4F1A\u53D8\u6210 /inbox/foo/bar",
+    rootHpathHint: "\u4F8B\u5982\u586B /inbox\uFF1B\u76D1\u542C\u6587\u4EF6\u5939\u91CC\u7684 foo/bar.md \u4F1A\u53D8\u6210 /inbox/foo/bar\u3002\u7559\u7A7A = \u76F4\u63A5\u5B58\u5230\u7B14\u8BB0\u672C\u6839\u76EE\u5F55\uFF08foo/bar.md \u2192 /foo/bar\uFF09",
+    rootHpathPlaceholder: "\u7559\u7A7A = \u7B14\u8BB0\u672C\u6839\u76EE\u5F55",
     writeBackIAL: "\u5C06\u601D\u6E90\u751F\u6210\u7684 IAL \u5757 ID \u5199\u56DE .md \u6E90\u6587\u4EF6",
     writeBackIALHint: "\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF09\u540E .md \u4FDD\u6301\u5E72\u51C0\uFF0C\u5757\u5F15\u7528 ((xxx)) \u4F1A\u5931\u6548",
     bidirectional: "\u53CC\u5411\u540C\u6B65\uFF1A\u601D\u6E90\u91CC\u4FEE\u6539\u4E5F\u81EA\u52A8\u5199\u56DE .md",
@@ -362,7 +363,8 @@ var messages = {
     targetNotebook: "Target notebook",
     targetNotebookDesc: "Synced documents will be created inside this notebook",
     rootHpath: "Target HPath (root path inside the notebook)",
-    rootHpathHint: "e.g. /inbox; watched/foo/bar.md becomes /inbox/foo/bar",
+    rootHpathHint: "e.g. /inbox \u2192 watched/foo/bar.md becomes /inbox/foo/bar. Leave empty for notebook root (foo/bar.md \u2192 /foo/bar)",
+    rootHpathPlaceholder: "empty = notebook root",
     writeBackIAL: "Write back Siyuan IAL block IDs into the source .md",
     writeBackIALHint: "Off keeps .md clean, but breaks block references ((xxx))",
     bidirectional: "Bidirectional: Siyuan edits auto-write back to .md",
@@ -424,8 +426,8 @@ function relToRoot(absPath, folders) {
 }
 function toHPath(rootHpath, rel) {
   const stem = rel.replace(/\.md$/i, "");
-  const root = rootHpath.endsWith("/") ? rootHpath.slice(0, -1) : rootHpath;
-  return root + "/" + stem;
+  const r = (rootHpath || "").replace(/\/+$/, "");
+  return r ? `${r}/${stem}` : `/${stem}`;
 }
 var Sync = class {
   constructor(api, state, opts = {}) {
@@ -1188,10 +1190,15 @@ var index_default = class extends import_siyuan5.Plugin {
   }
   _renderRootHpathInput() {
     const cfg = this.state.getActive();
-    this._hpathInput.value = cfg?.rootHpath || "/inbox";
+    this._hpathInput.value = cfg?.rootHpath || "";
+    this._hpathInput.placeholder = t("rootHpathPlaceholder");
     this._hpathInput.onchange = () => {
       const cur = this.state.ensureActive();
-      if (cur) cur.rootHpath = this._hpathInput.value || "/inbox";
+      if (cur) {
+        cur.rootHpath = this._hpathInput.value.trim();
+        this._hpathInput.value = cur.rootHpath;
+        this.state.save();
+      }
     };
   }
   _renderFolderList() {
