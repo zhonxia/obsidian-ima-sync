@@ -94,7 +94,7 @@ var Api = class {
 
 // src/state.js
 var STORAGE_KEY = "state";
-var SCHEMA_VERSION = 2;
+var SCHEMA_VERSION = 3;
 var State = class {
   constructor(plugin) {
     this.plugin = plugin;
@@ -110,7 +110,7 @@ var State = class {
       const raw = await this.plugin.loadData(STORAGE_KEY);
       if (!raw) return;
       if (!raw.schemaVersion || raw.schemaVersion < 2) {
-        this._migrateV1(raw);
+        this._migrateV1Notebooks(raw);
       } else {
         this.notebooks = raw.notebooks || {};
         this.activeNotebookId = raw.activeNotebookId || "";
@@ -118,24 +118,40 @@ var State = class {
       this.writeBackIAL = raw.writeBackIAL === true;
       this.importOnChange = raw.importOnChange !== false;
       this.bidirectional = raw.bidirectional !== false;
-      this.mappings = raw.mappings || {};
-      if (this.activeNotebookId) {
-        for (const info of Object.values(this.mappings)) {
-          if (!info.notebookId) info.notebookId = this.activeNotebookId;
-        }
+      const oldMappings = raw.mappings || {};
+      if (!raw.schemaVersion || raw.schemaVersion < 3) {
+        this.mappings = this._migrateMappingsToMulti(oldMappings, this.activeNotebookId);
+      } else {
+        this.mappings = oldMappings;
       }
       if (this.activeNotebookId && !this.notebooks[this.activeNotebookId]) {
         this.activeNotebookId = Object.keys(this.notebooks)[0] || "";
+      }
+      this._recoverNotebooksFromMappings();
+      if (!raw.schemaVersion || raw.schemaVersion < SCHEMA_VERSION) {
+        console.log("[state] auto-save after migration to v" + SCHEMA_VERSION);
+        await this.save();
       }
     } catch (e) {
       console.warn("[state] load failed:", e);
     }
   }
-  /**
-   * v1 → v2 数据迁移：把全局的 {notebookId, rootHpath, folders}
-   * 挪到 notebooks[oldNotebookId] 下面。
-   */
-  _migrateV1(raw) {
+  /** 从 mappings 恢复：凡是 instances 提到的 notebookId，若 notbooks 里没有，就加一个空配置 */
+  _recoverNotebooksFromMappings() {
+    const used = /* @__PURE__ */ new Set();
+    for (const m of Object.values(this.mappings || {})) {
+      for (const inst of m.instances || []) {
+        if (inst?.notebookId) used.add(inst.notebookId);
+      }
+    }
+    for (const nbId of used) {
+      if (!this.notebooks[nbId]) {
+        console.log("[state] recovering notebook config for", nbId.slice(0, 14) + "...");
+        this.notebooks[nbId] = { folders: [], rootHpath: "/inbox" };
+      }
+    }
+  }
+  _migrateV1Notebooks(raw) {
     const oldNbId = raw.notebookId || "";
     const oldFolders = raw.folders || [];
     const oldRootHpath = raw.rootHpath || "/inbox";
@@ -146,7 +162,31 @@ var State = class {
       };
       this.activeNotebookId = oldNbId;
     }
-    console.log("[state] migrated v1 \u2192 v2, notebook count:", Object.keys(this.notebooks).length);
+  }
+  /** v1/v2 单实例 → v3 多实例。 */
+  _migrateMappingsToMulti(oldMappings, fallbackNotebookId) {
+    const out = {};
+    for (const [absPath, info] of Object.entries(oldMappings)) {
+      if (!info) continue;
+      if (info.instances) {
+        out[absPath] = info;
+        continue;
+      }
+      const notebookId = info.notebookId || fallbackNotebookId;
+      if (!notebookId) {
+        continue;
+      }
+      out[absPath] = {
+        mdHash: info.mdHash || "",
+        instances: [{
+          docId: info.docId,
+          hpath: info.hpath || "",
+          syHash: info.syHash || "",
+          notebookId
+        }]
+      };
+    }
+    return out;
   }
   async save() {
     try {
@@ -164,14 +204,12 @@ var State = class {
     }
   }
   // ============================================================
-  // 查询/修改当前激活笔记本的配置
+  // 笔记本配置（per-notebook folders/rootHpath）
   // ============================================================
-  /** 返回当前激活笔记本的配置对象（不存在则返回 null）。 */
   getActive() {
     if (!this.activeNotebookId) return null;
     return this.notebooks[this.activeNotebookId] || null;
   }
-  /** 确保当前激活笔记本存在配置项（懒创建）。 */
   ensureActive() {
     if (!this.activeNotebookId) return null;
     if (!this.notebooks[this.activeNotebookId]) {
@@ -179,34 +217,12 @@ var State = class {
     }
     return this.notebooks[this.activeNotebookId];
   }
-  /** 切换 activeNotebookId。会停止并重启 watcher。 */
   setActive(notebookId) {
     this.activeNotebookId = notebookId || "";
     if (this.activeNotebookId && !this.notebooks[this.activeNotebookId]) {
       this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "/inbox" };
     }
   }
-  // ============================================================
-  // mappings（按 .md 路径）
-  // ============================================================
-  get(absPath) {
-    return this.mappings[absPath] || null;
-  }
-  set(absPath, info) {
-    this.mappings[absPath] = { ...info, lastSync: Date.now() };
-  }
-  remove(absPath) {
-    delete this.mappings[absPath];
-  }
-  byDocId(docId) {
-    for (const [k, v] of Object.entries(this.mappings)) {
-      if (v.docId === docId) return { path: k, ...v };
-    }
-    return null;
-  }
-  // ============================================================
-  // 跨所有笔记本：用于 reconcile / watcher 遍历
-  // ============================================================
   /** 返回 [{notebookId, folder, rootHpath}, ...] 所有笔记本的所有监听文件夹。 */
   allWatched() {
     const out = [];
@@ -217,6 +233,62 @@ var State = class {
       }
     }
     return out;
+  }
+  // ============================================================
+  // mappings（multi-instance）
+  // ============================================================
+  /** 返回 {mdHash, instances: [...]}; 不存在则 null */
+  get(absPath) {
+    return this.mappings[absPath] || null;
+  }
+  /** 添加或更新一个 instance。mdHash 是文件在磁盘上的 hash。 */
+  upsertInstance(absPath, instance, mdHash) {
+    if (!this.mappings[absPath]) {
+      this.mappings[absPath] = { mdHash: mdHash || "", instances: [] };
+    }
+    if (mdHash !== void 0) this.mappings[absPath].mdHash = mdHash;
+    const arr = this.mappings[absPath].instances;
+    const idx = arr.findIndex((i) => i.notebookId === instance.notebookId);
+    if (idx >= 0) {
+      arr[idx] = { ...arr[idx], ...instance, lastSync: Date.now() };
+    } else {
+      arr.push({ ...instance, lastSync: Date.now() });
+    }
+  }
+  /** 移除某 instance（按 docId）。如果该 path 没有 instance 了，删除整个 entry。 */
+  removeInstance(absPath, docId) {
+    const m = this.mappings[absPath];
+    if (!m) return;
+    m.instances = m.instances.filter((i) => i.docId !== docId);
+    if (m.instances.length === 0) {
+      delete this.mappings[absPath];
+    }
+  }
+  /** 按 docId 找到 instance 和 path。 */
+  byDocId(docId) {
+    for (const [path4, m] of Object.entries(this.mappings)) {
+      for (const inst of m.instances || []) {
+        if (inst.docId === docId) return { path: path4, mdHash: m.mdHash, instance: inst };
+      }
+    }
+    return null;
+  }
+  /** 删除整个 mapping entry。 */
+  remove(absPath) {
+    delete this.mappings[absPath];
+  }
+  /** 按 notebookId 移除该 path 的 instance（用于从笔记本上删除文件夹时）。 */
+  removeByNotebook(absPath, notebookId) {
+    const m = this.mappings[absPath];
+    if (!m) return;
+    m.instances = m.instances.filter((i) => i.notebookId !== notebookId);
+    if (m.instances.length === 0) {
+      delete this.mappings[absPath];
+    }
+  }
+  /** 返回所有 path。用于 cmdCleanIal。 */
+  allPaths() {
+    return Object.keys(this.mappings);
   }
 };
 
@@ -251,7 +323,8 @@ var messages = {
     cmdImportFile: "\u5BFC\u5165 Markdown \u6587\u4EF6",
     cmdImportFolder: "\u5BFC\u5165 Markdown \u6587\u4EF6\u5939",
     cmdExportCurrent: "\u5C06\u5F53\u524D\u6587\u6863\u5BFC\u51FA\u4E3A .md",
-    cmdReconcile: "\u7ACB\u5373\u5BF9\u8D26\uFF08\u626B\u4E00\u904D\u6240\u6709\u76D1\u542C\u6587\u4EF6\u5939\uFF09",
+    cmdReconcile: "\u7ACB\u5373\u5BF9\u8D26\uFF08\u626B\u6240\u6709\u76D1\u542C\u6587\u4EF6\u5939+\u6240\u6709\u7B14\u8BB0\u672C\uFF09",
+    reconciling: "\u5BF9\u8D26\u4E2D...",
     cmdForcePull: "\u4ECE\u601D\u6E90\u62C9\u53D6\u6240\u6709\u6620\u5C04\u6587\u6863\u5230 .md\uFF08\u8C03\u8BD5\uFF09",
     forcePullDone: "\u5DF2\u62C9\u53D6",
     cmdCleanIal: "\u6E05\u7406\u6240\u6709 .md \u91CC\u7684 IAL \u5757 ID \u566A\u97F3",
@@ -298,7 +371,8 @@ var messages = {
     cmdImportFile: "Import Markdown file",
     cmdImportFolder: "Import Markdown folder",
     cmdExportCurrent: "Export current document as .md",
-    cmdReconcile: "Reconcile now (scan all watched folders)",
+    cmdReconcile: "Reconcile now (all folders, all notebooks)",
+    reconciling: "reconciling...",
     cmdForcePull: "Force pull all mapped docs from Siyuan (debug)",
     forcePullDone: "pulled",
     cmdCleanIal: "Strip IAL block IDs from all .md files",
@@ -361,28 +435,32 @@ var Sync = class {
     this.log = opts.log || console.log;
     this._pullTimers = {};
   }
-  /** 给定一个 .md 的绝对路径，判断它归属哪个笔记本的哪个监听文件夹。 */
-  findWatchedFolder(absPath) {
+  /** 给定一个 .md 的绝对路径，返回所有应拥有它的 (notebookId, folder, rootHpath)。 */
+  findWatchers(absPath) {
+    const out = [];
     for (const item of this.state.allWatched()) {
       const f = item.folder;
-      if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) return item;
+      if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) {
+        out.push(item);
+      }
     }
-    return null;
+    return out;
   }
   // ============================================================
   // fs → siyuan
   // ============================================================
   /**
-   * 导入/更新一个 .md 文件。
-   * @returns {string|null} 新建/更新后的 doc id，失败为 null
+   * 导入/更新一个 .md 到所有相关的笔记本。
+   * - 没传 target 时，自动找出所有应拥有此文件的笔记本
+   * - 传了 target 时只导入到那个笔记本（用于 reconcile 里的精确控制）
+   * @returns {string|null} 第一个 instance 的 docId，失败为 null
    */
-  async importFile(absPath, { force = false } = {}) {
-    const watched = this.findWatchedFolder(absPath);
-    if (!watched) {
+  async importFile(absPath, target = null) {
+    const targets = target ? [target] : this.findWatchers(absPath);
+    if (targets.length === 0) {
       this.log("[import] \u8DEF\u5F84\u4E0D\u5728\u4EFB\u4F55\u76D1\u542C\u76EE\u5F55\u5185:", absPath);
       return null;
     }
-    const { notebookId, folder, rootHpath } = watched;
     let content;
     try {
       content = await import_promises.default.readFile(absPath, "utf-8");
@@ -392,70 +470,80 @@ var Sync = class {
     }
     const h = sha256(content);
     const existing = this.state.get(absPath);
-    if (!force && existing && existing.mdHash === h) {
-      this.log("[import] hash \u5339\u914D\uFF0C\u8DF3\u8FC7:", absPath);
-      return existing.docId;
+    const needsUpdate = !existing || existing.mdHash !== h || targets.some((t2) => !existing.instances.some((i) => i.notebookId === t2.notebookId));
+    if (!needsUpdate) {
+      return existing.instances[0].docId;
     }
+    let firstId = null;
+    for (const t2 of targets) {
+      const id = await this._importOne(absPath, content, h, t2, existing);
+      if (id && !firstId) firstId = id;
+    }
+    await this.state.save();
+    return firstId;
+  }
+  /**
+   * 把一份 .md 内容导入到单个 (notebookId, folder, rootHpath)。
+   * 删除该笔记本上该 path 的旧 doc（如有），创建新 doc，更新 instance。
+   */
+  async _importOne(absPath, content, h, target, existing) {
+    const { notebookId, folder, rootHpath } = target;
+    const oldInst = existing?.instances?.find((i) => i.notebookId === notebookId);
     const rel = relToRoot(absPath, [folder]);
     const hpath = toHPath(rootHpath, rel);
     try {
-      if (existing?.docId) {
-        const storage = await this.api.getDocStoragePath(existing.docId);
-        if (storage) {
-          await this.api.removeDoc(notebookId, storage);
+      if (oldInst?.docId) {
+        try {
+          const storage = await this.api.getDocStoragePath(oldInst.docId);
+          if (storage) await this.api.removeDoc(notebookId, storage);
+        } catch (e) {
+          this.log("[import] \u65E7 doc \u5DF2\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u5220\u9664:", oldInst.docId);
         }
       }
+      this.log("[import] creating", hpath, "in", notebookId.slice(0, 12) + "...");
       const newId = await this.api.createDocWithMd(notebookId, hpath, content);
+      this.log("[import] createDocWithMd returned:", JSON.stringify(newId));
       if (!newId) throw new Error("createDocWithMd \u672A\u8FD4\u56DE id");
       const syContent = await this.api.getDocKramdown(newId);
-      const syHash = sha256(syContent);
-      let fileOnDiskHash = h;
+      const syHash = sha256(stripIal(syContent));
       if (this.state.writeBackIAL && syContent !== content) {
         await import_promises.default.writeFile(absPath, syContent, "utf-8");
-        fileOnDiskHash = syHash;
       }
-      this.state.set(absPath, {
+      this.state.upsertInstance(absPath, {
         docId: newId,
         hpath,
-        notebookId,
-        mdHash: fileOnDiskHash,
-        syHash
-      });
-      this.state.save();
-      this.log("[import] OK", absPath, "\u2192", hpath, "(in", notebookId.slice(0, 8) + "...)");
+        syHash,
+        notebookId
+      }, h);
+      this.log("[import] OK", absPath, "\u2192", hpath, "in", notebookId.slice(0, 8) + "...", "docId=" + newId, "syHash=" + syHash.slice(0, 8));
       return newId;
     } catch (e) {
-      this.log("[import] \u5931\u8D25", absPath, e.message);
-      this.notify(t("error") + ": " + e.message, "error");
+      this.log("[import] \u5931\u8D25", absPath, "\u2192", notebookId, e.message);
+      this.notify(`${t("error")}: ${absPath} \u2192 ${notebookId.slice(0, 8)}: ${e.message}`, "error");
       return null;
     }
   }
-  /** 删除 fs 文件时，同步删除思源文档。 */
+  /** 删除 fs 文件时，同步删除所有 instance 对应的思源文档。 */
   async deleteFile(absPath) {
-    const existing = this.state.get(absPath);
-    if (!existing?.docId) return;
-    const notebookId = existing.notebookId || this.state.activeNotebookId;
-    if (!notebookId) {
-      this.log("[delete] \u627E\u4E0D\u5230\u5F52\u5C5E\u7B14\u8BB0\u672C\uFF0C\u8DF3\u8FC7:", absPath);
-      return;
-    }
-    try {
-      const storage = await this.api.getDocStoragePath(existing.docId);
-      if (storage) {
-        await this.api.removeDoc(notebookId, storage);
-        this.log("[delete] OK", absPath);
+    const mapping = this.state.get(absPath);
+    if (!mapping) return;
+    for (const inst of mapping.instances) {
+      try {
+        const storage = await this.api.getDocStoragePath(inst.docId);
+        if (storage) {
+          await this.api.removeDoc(inst.notebookId, storage);
+          this.log("[delete] OK", absPath, "in", inst.notebookId.slice(0, 8) + "...");
+        }
+      } catch (e) {
+        this.log("[delete] \u5931\u8D25", absPath, "in", inst.notebookId, e.message);
       }
-    } catch (e) {
-      this.log("[delete] \u5931\u8D25", absPath, e.message);
-    } finally {
-      this.state.remove(absPath);
-      this.state.save();
     }
+    this.state.remove(absPath);
+    await this.state.save();
   }
   // ============================================================
   // 批量
   // ============================================================
-  /** 递归收集文件夹下所有 .md。 */
   async walkMd(folderPath) {
     const out = [];
     const walk = async (dir) => {
@@ -475,7 +563,6 @@ var Sync = class {
     await walk(folderPath);
     return out;
   }
-  /** 导入整个文件夹（已存在于监听列表中的会被自动用监听路径计算 hpath）。 */
   async importFolder(folderPath) {
     this.notify(t("importing"));
     const files = await this.walkMd(folderPath);
@@ -490,12 +577,6 @@ var Sync = class {
   // ============================================================
   // siyuan → fs（手动）
   // ============================================================
-  /**
-   * 将思源文档导出为 .md 文件。
-   * @param {string} docId
-   * @param {string} targetAbsPath 绝对目标路径（必须是 .md）
-   * @returns {boolean}
-   */
   async exportDocToFile(docId, targetAbsPath) {
     try {
       const kramdown = await this.api.getDocKramdown(docId);
@@ -515,13 +596,13 @@ var Sync = class {
       }
       await import_promises.default.writeFile(targetAbsPath, kramdown, "utf-8");
       const h = sha256(kramdown);
-      this.state.set(targetAbsPath, {
+      this.state.upsertInstance(targetAbsPath, {
         docId,
         hpath: "",
-        mdHash: h,
-        syHash: h
-      });
-      this.state.save();
+        syHash: h,
+        notebookId: this.state.activeNotebookId || ""
+      }, h);
+      await this.state.save();
       this.notify(t("exported"));
       return true;
     } catch (e) {
@@ -532,17 +613,14 @@ var Sync = class {
   // ============================================================
   // siyuan → fs（事件驱动的反向同步）
   // ============================================================
-  /**
-   * 监听 ws-main 事件：检查消息里有没有我们追踪的 doc id，有就排程一次 pull。
-   * 思路：把所有追踪到的 docId 拼成一个集合，扫描消息 data 的字符串表示，
-   * 任何 docId 子串命中就排程。
-   */
   onWebSocketMessage(msg) {
     if (this.state.bidirectional === false) return;
     if (!msg || !msg.data) return;
     const trackedIds = /* @__PURE__ */ new Set();
-    for (const info of Object.values(this.state.mappings || {})) {
-      if (info?.docId) trackedIds.add(info.docId);
+    for (const m of Object.values(this.state.mappings || {})) {
+      for (const inst of m.instances || []) {
+        if (inst?.docId) trackedIds.add(inst.docId);
+      }
     }
     if (trackedIds.size === 0) return;
     const dataStr = this._safeStringify(msg.data);
@@ -559,7 +637,6 @@ var Sync = class {
       return "";
     }
   }
-  /** Debounce: 800ms 内多次触发同一 docId 只 pull 一次。 */
   schedulePull(docId) {
     if (this._pullTimers[docId]) clearTimeout(this._pullTimers[docId]);
     this._pullTimers[docId] = setTimeout(() => {
@@ -568,16 +645,16 @@ var Sync = class {
     }, 800);
   }
   /**
-   * 把思源文档的最新 kramdown 写回对应的 .md 文件。
-   * 防回声关键：写完后把 mdHash 和 syHash 都更新成新 hash，
-   * 这样 fs.watch → importFile 时 hash 匹配会跳过，不会重新 import 思源。
+   * 把思源文档的最新内容写回对应的 .md 文件。
+   * 写完后更新 mdHash + 所有 instance 的 syHash（防止任意一个笔记本的 echo 重导）。
    */
   async pullFromSiyuan(docId) {
-    const mapping = this.state.byDocId(docId);
-    if (!mapping) {
+    const found = this.state.byDocId(docId);
+    if (!found) {
       this.log("[pull] docId \u672A\u8FFD\u8E2A:", docId);
       return;
     }
+    const { path: absPath, mdHash: oldMdHash, instance: inst } = found;
     let kramdown;
     try {
       kramdown = await this.api.getDocKramdown(docId);
@@ -587,58 +664,81 @@ var Sync = class {
     }
     const cleaned = stripIal(kramdown);
     const cleanedHash = sha256(cleaned);
-    const existing = this.state.get(mapping.path);
-    if (existing && existing.syHash === cleanedHash) {
-      this.log("[pull] \u5185\u5BB9\u672A\u53D8\uFF0C\u8DF3\u8FC7:", mapping.path);
+    const newMdHash = cleanedHash;
+    if (inst.syHash === cleanedHash) {
+      this.log("[pull] syHash \u4E00\u81F4\uFF0C\u8DF3\u8FC7:", absPath);
       return;
     }
     try {
-      await import_promises.default.writeFile(mapping.path, cleaned, "utf-8");
+      await import_promises.default.writeFile(absPath, cleaned, "utf-8");
     } catch (e) {
-      this.log("[pull] writeFile \u5931\u8D25", mapping.path, e.message);
+      this.log("[pull] writeFile \u5931\u8D25", absPath, e.message);
       return;
     }
-    this.state.set(mapping.path, {
-      ...existing,
+    this.state.upsertInstance(absPath, {
+      ...inst,
       docId,
-      hpath: existing?.hpath || "",
-      mdHash: cleanedHash,
       syHash: cleanedHash
-    });
+    }, newMdHash);
     await this.state.save();
-    this.log("[pull] OK", mapping.path, "\u2190", docId);
+    this.log("[pull] OK", absPath, "\u2190", docId, "mdHash updated, all instances will resync");
   }
   // ============================================================
   // 对账（手动触发或启动时调用）
   // ============================================================
-  /** 遍历所有监听文件夹，处理 hash 不一致的 .md。 */
+  /**
+   * 遍历所有监听文件夹，把每个 .md 同步到所有应该拥有它的笔记本。
+   * 规则：
+   * - 文件 mdHash 变了 → 重新生成该 path 在所有 target 上的 instance
+   * - 某 target 还没有该 path 的 instance → 创建一个（1-to-many 场景）
+   */
   async reconcile() {
     this.log("[reconcile] start");
-    let changed = 0;
     const watched = this.state.allWatched();
+    this.log("[reconcile] watched:", watched.map((w) => `${w.notebookId.slice(0, 8)}\u2026: ${w.folder.path}`).join("; "));
     if (watched.length === 0) {
       this.notify("\u6CA1\u6709\u914D\u7F6E\u4EFB\u4F55\u76D1\u542C\u6587\u4EF6\u5939");
       return 0;
     }
+    const folderCache = /* @__PURE__ */ new Map();
     for (const item of watched) {
-      try {
-        const files = await this.walkMd(item.folder.path);
-        for (const f of files) {
-          const content = await import_promises.default.readFile(f, "utf-8").catch(() => null);
-          if (content == null) continue;
-          const h = sha256(content);
-          const ex = this.state.get(f);
-          if (!ex || ex.mdHash !== h) {
-            const id = await this.importFile(f);
-            if (id) changed++;
-          }
-        }
-      } catch (e) {
-        this.log("[reconcile] folder error", item.folder.path, e.message);
+      if (!folderCache.has(item.folder.path)) {
+        folderCache.set(item.folder.path, await this.walkMd(item.folder.path));
       }
     }
-    this.notify(`${t("reconcileDone")}: ${changed}`);
-    return changed;
+    let totalChanged = 0;
+    const summary = { added: 0, updated: 0, skipped: 0, failed: 0 };
+    for (const item of watched) {
+      const files = folderCache.get(item.folder.path) || [];
+      this.log("[reconcile] scanning", item.folder.path, "for notebook", item.notebookId.slice(0, 12) + "...", "\u2192", files.length, "files");
+      for (const f of files) {
+        const content = await import_promises.default.readFile(f, "utf-8").catch(() => null);
+        if (content == null) {
+          summary.failed++;
+          continue;
+        }
+        const h = sha256(content);
+        const existing = this.state.get(f);
+        const hasInstance = existing?.instances?.some((i) => i.notebookId === item.notebookId);
+        if (existing && existing.mdHash === h && hasInstance) {
+          summary.skipped++;
+          continue;
+        }
+        this.log("[reconcile]", f, "\u2192", item.notebookId.slice(0, 12) + "...", "hasInstance=" + hasInstance, "mdMatch=" + (existing?.mdHash === h));
+        const id = await this.importFile(f, item);
+        if (id) {
+          totalChanged++;
+          if (hasInstance) summary.updated++;
+          else summary.added++;
+        } else {
+          summary.failed++;
+        }
+      }
+    }
+    const msg = `\u5BF9\u8D26\u5B8C\u6210\uFF1A\u65B0\u589E ${summary.added}\uFF0C\u66F4\u65B0 ${summary.updated}\uFF0C\u8DF3\u8FC7 ${summary.skipped}\uFF0C\u5931\u8D25 ${summary.failed}`;
+    this.notify(msg);
+    this.log("[reconcile]", msg);
+    return totalChanged;
   }
 };
 
@@ -848,13 +948,14 @@ function registerCommands(plugin) {
       const sha = (t2) => crypto2.createHash("sha256").update(t2).digest("hex");
       const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "").replace(/\{:[^}]*\}/g, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
       let n = 0;
-      for (const [absPath, info] of Object.entries(state.mappings || {})) {
+      for (const absPath of state.allPaths()) {
         try {
           const orig = await fs3.readFile(absPath, "utf-8");
           const cleaned = strip(orig);
           if (cleaned !== orig) {
             await fs3.writeFile(absPath, cleaned, "utf-8");
-            state.set(absPath, { ...info, mdHash: sha(cleaned) });
+            const m = state.get(absPath);
+            if (m) m.mdHash = sha(cleaned);
             n++;
           }
         } catch (e) {
@@ -942,7 +1043,12 @@ var index_default = class extends import_siyuan5.Plugin {
           api: this.api,
           forcePull: (docId) => this.sync.pullFromSiyuan(docId),
           forcePullAll: async () => {
-            const ids = Object.values(this.state.mappings || {}).map((m) => m.docId).filter(Boolean);
+            const ids = /* @__PURE__ */ new Set();
+            for (const m of Object.values(this.state.mappings || {})) {
+              for (const inst of m.instances || []) {
+                if (inst?.docId) ids.add(inst.docId);
+              }
+            }
             const results = [];
             for (const id of ids) {
               try {
@@ -954,7 +1060,13 @@ var index_default = class extends import_siyuan5.Plugin {
             }
             return results;
           },
-          simulateWsEvent: (docId) => this.sync.schedulePull(docId)
+          simulateWsEvent: (docId) => this.sync.schedulePull(docId),
+          reconcile: () => this.sync.reconcile(),
+          dump: () => ({
+            activeNotebookId: this.state.activeNotebookId,
+            notebooks: this.state.notebooks,
+            mappings: this.state.mappings
+          })
         };
         this.log("window.__mdSync ready (debug)");
       }
@@ -1052,14 +1164,19 @@ var index_default = class extends import_siyuan5.Plugin {
   _renderNotebookSelect(sel) {
     sel.innerHTML = "";
     const current = this.state.activeNotebookId;
-    if (!this.notebooks.some((nb) => nb.id === current)) {
-      if (current) {
-        const opt = document.createElement("option");
-        opt.value = current;
-        opt.textContent = `(\u4E0D\u53EF\u7528) ${current.slice(0, 8)}\u2026`;
-        opt.selected = true;
-        sel.appendChild(opt);
-      }
+    if (current && !this.notebooks.some((nb) => nb.id === current)) {
+      const opt = document.createElement("option");
+      opt.value = current;
+      opt.textContent = `(\u4E0D\u53EF\u7528) ${current.slice(0, 8)}\u2026`;
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+    if (!current) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "\u2014 \u8BF7\u5148\u9009\u62E9\u4E00\u4E2A\u7B14\u8BB0\u672C \u2014";
+      opt.selected = true;
+      sel.appendChild(opt);
     }
     for (const nb of this.notebooks) {
       const opt = document.createElement("option");
@@ -1111,9 +1228,13 @@ var index_default = class extends import_siyuan5.Plugin {
     addBtn.textContent = "+ " + t("addFolder");
     addBtn.className = "b3-button b3-button--outline fn__size200";
     addBtn.addEventListener("click", async () => {
+      const cur = this.state.ensureActive();
+      if (!cur) {
+        this.notify("\u8BF7\u5148\u5728\u4E0A\u65B9\u4E0B\u62C9\u6846\u4E2D\u9009\u62E9\u4E00\u4E2A\u7B14\u8BB0\u672C", "error");
+        return;
+      }
       const p = await inputDialog2(t("addFolderTitle"), t("addFolderPrompt"), "/Users/me/notes");
       if (p) {
-        const cur = this.state.ensureActive();
         cur.folders.push({ path: p, label: p });
         await this.state.save();
         this._renderFolderList();
@@ -1124,6 +1245,34 @@ var index_default = class extends import_siyuan5.Plugin {
       }
     });
     list.appendChild(addBtn);
+    const stats = document.createElement("div");
+    stats.style.cssText = "font-size:12px;color:var(--b3-theme-on-surface-light);margin-top:4px;";
+    const updateStats = () => {
+      const cfg2 = this.state.getActive();
+      const folderCount = cfg2?.folders?.length || 0;
+      const fileCount = Object.values(this.state.mappings).filter(
+        (m) => m.instances.some((i) => i.notebookId === this.state.activeNotebookId)
+      ).length;
+      stats.textContent = `\u5F53\u524D\u7B14\u8BB0\u672C\uFF1A${folderCount} \u4E2A\u6587\u4EF6\u5939\uFF0C\u5DF2\u6620\u5C04 ${fileCount} \u4E2A .md`;
+    };
+    updateStats();
+    const reconcileBtn = document.createElement("button");
+    reconcileBtn.textContent = "\u{1F504} " + t("cmdReconcile");
+    reconcileBtn.className = "b3-button b3-button--outline fn__size200";
+    reconcileBtn.style.marginTop = "8px";
+    reconcileBtn.addEventListener("click", async () => {
+      reconcileBtn.disabled = true;
+      reconcileBtn.textContent = "\u23F3 " + t("reconciling");
+      try {
+        await this.sync.reconcile();
+        updateStats();
+      } finally {
+        reconcileBtn.disabled = false;
+        reconcileBtn.textContent = "\u{1F504} " + t("cmdReconcile");
+      }
+    });
+    list.appendChild(reconcileBtn);
+    list.appendChild(stats);
     this._folderContainer.appendChild(list);
   }
   startWatcher() {

@@ -124,13 +124,15 @@ export function registerCommands(plugin) {
       const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
       const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '').replace(/\{:[^}]*\}/g, '').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
       let n = 0;
-      for (const [absPath, info] of Object.entries(state.mappings || {})) {
+      for (const absPath of state.allPaths()) {
         try {
           const orig = await fs.readFile(absPath, 'utf-8');
           const cleaned = strip(orig);
           if (cleaned !== orig) {
             await fs.writeFile(absPath, cleaned, 'utf-8');
-            state.set(absPath, { ...info, mdHash: sha(cleaned) });
+            // 只更新 mdHash，instances 保留
+            const m = state.get(absPath);
+            if (m) m.mdHash = sha(cleaned);
             n++;
           }
         } catch (e) { /* 文件可能被删了 */ }

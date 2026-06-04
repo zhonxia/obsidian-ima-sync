@@ -1,11 +1,11 @@
 /**
  * 核心同步逻辑。
  *
- * 设计原则（v2 简化版）：
- * - 主动同步：fs → siyuan（监听文件变动时自动）
- * - 手动同步：siyuan → fs（"导出当前文档为 .md"命令）
- * - 单向为主，回声检测靠 hash 缓存
- * - 冲突时备份 .md 为 .conflict-<ts>.md，不自动 merge
+ * 设计：
+ * - 1-to-many: 同一个 .md 文件可以同步到多个笔记本，每个笔记本一个 docId
+ * - mappings[path] = { mdHash, instances: [{docId, notebookId, hpath, syHash}, ...] }
+ * - mdHash 是文件磁盘内容 hash（共享）
+ * - 每个 instance 各自有 syHash（思源侧的 hash，用于回声抑制）
  */
 
 import crypto from 'crypto';
@@ -24,18 +24,13 @@ const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
  * doc 末尾的 `{: ... type="doc" ...}` 也是独占一行。
  */
 function stripIal(text) {
-  // 删掉独占一行的 IAL（包括它自己的换行）
   let out = text.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '');
-  // 删掉行内末尾的 IAL（紧跟在普通字符后面，没有换行）
   out = out.replace(/\{:[^}]*\}/g, '');
-  // 删掉连续空行
   out = out.replace(/\n{3,}/g, '\n\n');
-  // 去尾部多余空白
   out = out.replace(/\s+$/, '');
   return out;
 }
 
-/** 文件路径（绝对）→ 在 HPath root 下的相对路径。返回 null 表示不在任何监听目录下。 */
 function relToRoot(absPath, folders) {
   for (const f of folders) {
     if (absPath.startsWith(f.path + path.sep) || absPath === f.path) {
@@ -47,14 +42,12 @@ function relToRoot(absPath, folders) {
   return null;
 }
 
-/** rel (e.g. "foo/bar.md") → 思源 HPath (e.g. "/inbox/foo/bar"). */
 function toHPath(rootHpath, rel) {
   const stem = rel.replace(/\.md$/i, '');
   const root = rootHpath.endsWith('/') ? rootHpath.slice(0, -1) : rootHpath;
   return root + '/' + stem;
 }
 
-/** 思源 HPath → 思源 HPath 下的"虚拟" .md 相对路径，用于回写到 fs。 */
 function fromHPath(rootHpath, hpath) {
   const root = rootHpath.endsWith('/') ? rootHpath.slice(0, -1) : rootHpath;
   if (!hpath.startsWith(root + '/')) return null;
@@ -70,13 +63,16 @@ export class Sync {
     this._pullTimers = {};
   }
 
-  /** 给定一个 .md 的绝对路径，判断它归属哪个笔记本的哪个监听文件夹。 */
-  findWatchedFolder(absPath) {
+  /** 给定一个 .md 的绝对路径，返回所有应拥有它的 (notebookId, folder, rootHpath)。 */
+  findWatchers(absPath) {
+    const out = [];
     for (const item of this.state.allWatched()) {
       const f = item.folder;
-      if (absPath.startsWith(f.path + path.sep) || absPath === f.path) return item;
+      if (absPath.startsWith(f.path + path.sep) || absPath === f.path) {
+        out.push(item);
+      }
     }
-    return null;
+    return out;
   }
 
   // ============================================================
@@ -84,16 +80,17 @@ export class Sync {
   // ============================================================
 
   /**
-   * 导入/更新一个 .md 文件。
-   * @returns {string|null} 新建/更新后的 doc id，失败为 null
+   * 导入/更新一个 .md 到所有相关的笔记本。
+   * - 没传 target 时，自动找出所有应拥有此文件的笔记本
+   * - 传了 target 时只导入到那个笔记本（用于 reconcile 里的精确控制）
+   * @returns {string|null} 第一个 instance 的 docId，失败为 null
    */
-  async importFile(absPath, { force = false } = {}) {
-    const watched = this.findWatchedFolder(absPath);
-    if (!watched) {
+  async importFile(absPath, target = null) {
+    const targets = target ? [target] : this.findWatchers(absPath);
+    if (targets.length === 0) {
       this.log('[import] 路径不在任何监听目录内:', absPath);
       return null;
     }
-    const { notebookId, folder, rootHpath } = watched;
     let content;
     try {
       content = await fs.readFile(absPath, 'utf-8');
@@ -103,81 +100,99 @@ export class Sync {
     }
     const h = sha256(content);
     const existing = this.state.get(absPath);
-    if (!force && existing && existing.mdHash === h) {
-      this.log('[import] hash 匹配，跳过:', absPath);
-      return existing.docId;
+
+    // 判断是否需要更新：
+    // - mdHash 变了（文件被改）
+    // - 某个 target 在该 path 下没有 instance（新笔记本接管）
+    // - force 标志
+    const needsUpdate = !existing
+      || existing.mdHash !== h
+      || targets.some(t => !existing.instances.some(i => i.notebookId === t.notebookId));
+
+    if (!needsUpdate) {
+      return existing.instances[0].docId;
     }
 
+    let firstId = null;
+    for (const t of targets) {
+      const id = await this._importOne(absPath, content, h, t, existing);
+      if (id && !firstId) firstId = id;
+    }
+    await this.state.save();
+    return firstId;
+  }
+
+  /**
+   * 把一份 .md 内容导入到单个 (notebookId, folder, rootHpath)。
+   * 删除该笔记本上该 path 的旧 doc（如有），创建新 doc，更新 instance。
+   */
+  async _importOne(absPath, content, h, target, existing) {
+    const { notebookId, folder, rootHpath } = target;
+    const oldInst = existing?.instances?.find(i => i.notebookId === notebookId);
     const rel = relToRoot(absPath, [folder]);
     const hpath = toHPath(rootHpath, rel);
 
     try {
-      // 先删旧（如果存在），否则新文档的 IAL 块 ID 不会被思源复用
-      if (existing?.docId) {
-        const storage = await this.api.getDocStoragePath(existing.docId);
-        if (storage) {
-          await this.api.removeDoc(notebookId, storage);
+      if (oldInst?.docId) {
+        try {
+          const storage = await this.api.getDocStoragePath(oldInst.docId);
+          if (storage) await this.api.removeDoc(notebookId, storage);
+        } catch (e) {
+          this.log('[import] 旧 doc 已不存在或无法删除:', oldInst.docId);
         }
       }
+      this.log('[import] creating', hpath, 'in', notebookId.slice(0,12)+'...');
       const newId = await this.api.createDocWithMd(notebookId, hpath, content);
+      this.log('[import] createDocWithMd returned:', JSON.stringify(newId));
       if (!newId) throw new Error('createDocWithMd 未返回 id');
 
-      // 回读以拿到思源规范化后的内容（带 IAL）
+      // 回读拿到 IAL；用 strip 后的内容算 syHash（与 pull 一致）
       const syContent = await this.api.getDocKramdown(newId);
-      const syHash = sha256(syContent);
+      const syHash = sha256(stripIal(syContent));
 
-      // 可选：把 IAL 写回源文件（让 .md 包含 {: id="..."}）
-      let fileOnDiskHash = h;
+      // 可选：把 IAL 写回源文件
       if (this.state.writeBackIAL && syContent !== content) {
         await fs.writeFile(absPath, syContent, 'utf-8');
-        fileOnDiskHash = syHash;
       }
 
-      this.state.set(absPath, {
+      this.state.upsertInstance(absPath, {
         docId: newId,
         hpath,
-        notebookId,
-        mdHash: fileOnDiskHash,
         syHash,
-      });
-      this.state.save();
-      this.log('[import] OK', absPath, '→', hpath, '(in', notebookId.slice(0, 8) + '...)');
+        notebookId,
+      }, h);
+      this.log('[import] OK', absPath, '→', hpath, 'in', notebookId.slice(0, 8) + '...', 'docId=' + newId, 'syHash=' + syHash.slice(0,8));
       return newId;
     } catch (e) {
-      this.log('[import] 失败', absPath, e.message);
-      this.notify(t('error') + ': ' + e.message, 'error');
+      this.log('[import] 失败', absPath, '→', notebookId, e.message);
+      this.notify(`${t('error')}: ${absPath} → ${notebookId.slice(0,8)}: ${e.message}`, 'error');
       return null;
     }
   }
 
-  /** 删除 fs 文件时，同步删除思源文档。 */
+  /** 删除 fs 文件时，同步删除所有 instance 对应的思源文档。 */
   async deleteFile(absPath) {
-    const existing = this.state.get(absPath);
-    if (!existing?.docId) return;
-    const notebookId = existing.notebookId || this.state.activeNotebookId;
-    if (!notebookId) {
-      this.log('[delete] 找不到归属笔记本，跳过:', absPath);
-      return;
-    }
-    try {
-      const storage = await this.api.getDocStoragePath(existing.docId);
-      if (storage) {
-        await this.api.removeDoc(notebookId, storage);
-        this.log('[delete] OK', absPath);
+    const mapping = this.state.get(absPath);
+    if (!mapping) return;
+    for (const inst of mapping.instances) {
+      try {
+        const storage = await this.api.getDocStoragePath(inst.docId);
+        if (storage) {
+          await this.api.removeDoc(inst.notebookId, storage);
+          this.log('[delete] OK', absPath, 'in', inst.notebookId.slice(0, 8) + '...');
+        }
+      } catch (e) {
+        this.log('[delete] 失败', absPath, 'in', inst.notebookId, e.message);
       }
-    } catch (e) {
-      this.log('[delete] 失败', absPath, e.message);
-    } finally {
-      this.state.remove(absPath);
-      this.state.save();
     }
+    this.state.remove(absPath);
+    await this.state.save();
   }
 
   // ============================================================
   // 批量
   // ============================================================
 
-  /** 递归收集文件夹下所有 .md。 */
   async walkMd(folderPath) {
     const out = [];
     const walk = async (dir) => {
@@ -185,7 +200,6 @@ export class Sync {
       try { entries = await fs.readdir(dir, { withFileTypes: true }); }
       catch (e) { return; }
       for (const e of entries) {
-        // 隐藏文件/系统文件跳过
         if (e.name.startsWith('.')) continue;
         const p = path.join(dir, e.name);
         if (e.isDirectory()) await walk(p);
@@ -196,7 +210,6 @@ export class Sync {
     return out;
   }
 
-  /** 导入整个文件夹（已存在于监听列表中的会被自动用监听路径计算 hpath）。 */
   async importFolder(folderPath) {
     this.notify(t('importing'));
     const files = await this.walkMd(folderPath);
@@ -213,16 +226,9 @@ export class Sync {
   // siyuan → fs（手动）
   // ============================================================
 
-  /**
-   * 将思源文档导出为 .md 文件。
-   * @param {string} docId
-   * @param {string} targetAbsPath 绝对目标路径（必须是 .md）
-   * @returns {boolean}
-   */
   async exportDocToFile(docId, targetAbsPath) {
     try {
       const kramdown = await this.api.getDocKramdown(docId);
-      // 冲突检测：如果目标文件已存在且 hash 与 state 中记录不同
       let existing = '';
       try { existing = await fs.readFile(targetAbsPath, 'utf-8'); } catch {}
       const existingRecord = this.state.get(targetAbsPath);
@@ -236,13 +242,14 @@ export class Sync {
       }
       await fs.writeFile(targetAbsPath, kramdown, 'utf-8');
       const h = sha256(kramdown);
-      this.state.set(targetAbsPath, {
+      // 暂时只给 activeNotebookId 建一个 instance（用户主动导出的不参与多副本）
+      this.state.upsertInstance(targetAbsPath, {
         docId,
         hpath: '',
-        mdHash: h,
         syHash: h,
-      });
-      this.state.save();
+        notebookId: this.state.activeNotebookId || '',
+      }, h);
+      await this.state.save();
       this.notify(t('exported'));
       return true;
     } catch (e) {
@@ -255,17 +262,14 @@ export class Sync {
   // siyuan → fs（事件驱动的反向同步）
   // ============================================================
 
-  /**
-   * 监听 ws-main 事件：检查消息里有没有我们追踪的 doc id，有就排程一次 pull。
-   * 思路：把所有追踪到的 docId 拼成一个集合，扫描消息 data 的字符串表示，
-   * 任何 docId 子串命中就排程。
-   */
   onWebSocketMessage(msg) {
     if (this.state.bidirectional === false) return;
     if (!msg || !msg.data) return;
     const trackedIds = new Set();
-    for (const info of Object.values(this.state.mappings || {})) {
-      if (info?.docId) trackedIds.add(info.docId);
+    for (const m of Object.values(this.state.mappings || {})) {
+      for (const inst of m.instances || []) {
+        if (inst?.docId) trackedIds.add(inst.docId);
+      }
     }
     if (trackedIds.size === 0) return;
     const dataStr = this._safeStringify(msg.data);
@@ -280,7 +284,6 @@ export class Sync {
     try { return JSON.stringify(obj); } catch { return ''; }
   }
 
-  /** Debounce: 800ms 内多次触发同一 docId 只 pull 一次。 */
   schedulePull(docId) {
     if (this._pullTimers[docId]) clearTimeout(this._pullTimers[docId]);
     this._pullTimers[docId] = setTimeout(() => {
@@ -290,16 +293,16 @@ export class Sync {
   }
 
   /**
-   * 把思源文档的最新 kramdown 写回对应的 .md 文件。
-   * 防回声关键：写完后把 mdHash 和 syHash 都更新成新 hash，
-   * 这样 fs.watch → importFile 时 hash 匹配会跳过，不会重新 import 思源。
+   * 把思源文档的最新内容写回对应的 .md 文件。
+   * 写完后更新 mdHash + 所有 instance 的 syHash（防止任意一个笔记本的 echo 重导）。
    */
   async pullFromSiyuan(docId) {
-    const mapping = this.state.byDocId(docId);
-    if (!mapping) {
+    const found = this.state.byDocId(docId);
+    if (!found) {
       this.log('[pull] docId 未追踪:', docId);
       return;
     }
+    const { path: absPath, mdHash: oldMdHash, instance: inst } = found;
     let kramdown;
     try {
       kramdown = await this.api.getDocKramdown(docId);
@@ -307,62 +310,91 @@ export class Sync {
       this.log('[pull] getDocKramdown 失败', docId, e.message);
       return;
     }
-    // 剥掉 IAL 块 ID 行（`{: id="..." ...}`），让 .md 文件保持干净
     const cleaned = stripIal(kramdown);
     const cleanedHash = sha256(cleaned);
-    const existing = this.state.get(mapping.path);
-    if (existing && existing.syHash === cleanedHash) {
-      this.log('[pull] 内容未变，跳过:', mapping.path);
+    const newMdHash = cleanedHash;
+
+    // 内容没变（syHash 比较）：什么都不做
+    if (inst.syHash === cleanedHash) {
+      this.log('[pull] syHash 一致，跳过:', absPath);
       return;
     }
+
     try {
-      await fs.writeFile(mapping.path, cleaned, 'utf-8');
+      await fs.writeFile(absPath, cleaned, 'utf-8');
     } catch (e) {
-      this.log('[pull] writeFile 失败', mapping.path, e.message);
+      this.log('[pull] writeFile 失败', absPath, e.message);
       return;
     }
-    this.state.set(mapping.path, {
-      ...existing,
+
+    // 更新该 instance 的 syHash（= 新 hash），同时把 mdHash 也更新成新 hash
+    // 关键：其他 instance 的 syHash 不动 —— 这样下次 fs.watch 触发 reconcile 时，
+    // mdHash 跟其他 instance 的 syHash 不一致，会被正确识别为"该文件改了，需要重导"
+    this.state.upsertInstance(absPath, {
+      ...inst,
       docId,
-      hpath: existing?.hpath || '',
-      mdHash: cleanedHash,
       syHash: cleanedHash,
-    });
+    }, newMdHash);
     await this.state.save();
-    this.log('[pull] OK', mapping.path, '←', docId);
+    this.log('[pull] OK', absPath, '←', docId, 'mdHash updated, all instances will resync');
   }
 
   // ============================================================
   // 对账（手动触发或启动时调用）
   // ============================================================
 
-  /** 遍历所有监听文件夹，处理 hash 不一致的 .md。 */
+  /**
+   * 遍历所有监听文件夹，把每个 .md 同步到所有应该拥有它的笔记本。
+   * 规则：
+   * - 文件 mdHash 变了 → 重新生成该 path 在所有 target 上的 instance
+   * - 某 target 还没有该 path 的 instance → 创建一个（1-to-many 场景）
+   */
   async reconcile() {
     this.log('[reconcile] start');
-    let changed = 0;
     const watched = this.state.allWatched();
+    this.log('[reconcile] watched:', watched.map(w => `${w.notebookId.slice(0,8)}…: ${w.folder.path}`).join('; '));
     if (watched.length === 0) {
       this.notify('没有配置任何监听文件夹');
       return 0;
     }
+
+    // 按 folder 缓存 walk 结果
+    const folderCache = new Map();
     for (const item of watched) {
-      try {
-        const files = await this.walkMd(item.folder.path);
-        for (const f of files) {
-          const content = await fs.readFile(f, 'utf-8').catch(() => null);
-          if (content == null) continue;
-          const h = sha256(content);
-          const ex = this.state.get(f);
-          if (!ex || ex.mdHash !== h) {
-            const id = await this.importFile(f);
-            if (id) changed++;
-          }
-        }
-      } catch (e) {
-        this.log('[reconcile] folder error', item.folder.path, e.message);
+      if (!folderCache.has(item.folder.path)) {
+        folderCache.set(item.folder.path, await this.walkMd(item.folder.path));
       }
     }
-    this.notify(`${t('reconcileDone')}: ${changed}`);
-    return changed;
+
+    // 对每个 (notebook, folder) 组合，把里面的每个文件 import 到那个笔记本
+    let totalChanged = 0;
+    const summary = { added: 0, updated: 0, skipped: 0, failed: 0 };
+    for (const item of watched) {
+      const files = folderCache.get(item.folder.path) || [];
+      this.log('[reconcile] scanning', item.folder.path, 'for notebook', item.notebookId.slice(0, 12) + '...', '→', files.length, 'files');
+      for (const f of files) {
+        const content = await fs.readFile(f, 'utf-8').catch(() => null);
+        if (content == null) { summary.failed++; continue; }
+        const h = sha256(content);
+        const existing = this.state.get(f);
+        const hasInstance = existing?.instances?.some(i => i.notebookId === item.notebookId);
+        if (existing && existing.mdHash === h && hasInstance) {
+          summary.skipped++;
+          continue;
+        }
+        this.log('[reconcile]', f, '→', item.notebookId.slice(0,12) + '...', 'hasInstance=' + hasInstance, 'mdMatch=' + (existing?.mdHash === h));
+        const id = await this.importFile(f, item);
+        if (id) {
+          totalChanged++;
+          if (hasInstance) summary.updated++; else summary.added++;
+        } else {
+          summary.failed++;
+        }
+      }
+    }
+    const msg = `对账完成：新增 ${summary.added}，更新 ${summary.updated}，跳过 ${summary.skipped}，失败 ${summary.failed}`;
+    this.notify(msg);
+    this.log('[reconcile]', msg);
+    return totalChanged;
   }
 }

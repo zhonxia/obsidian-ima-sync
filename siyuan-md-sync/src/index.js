@@ -72,11 +72,11 @@ export default class extends Plugin {
 
       registerCommands(this);
 
-      if (this.state.folders?.length && this.state.importOnChange) {
+      if (this.state.allWatched().length && this.state.importOnChange) {
         this.startWatcher();
       }
 
-      if (!this.state.notebookId) {
+      if (!this.state.activeNotebookId) {
         showMessage(t('firstRunHint'), 5000, 'info');
       } else {
         this.notify(t('pluginLoaded'));
@@ -92,7 +92,12 @@ export default class extends Plugin {
           api: this.api,
           forcePull: (docId) => this.sync.pullFromSiyuan(docId),
           forcePullAll: async () => {
-            const ids = Object.values(this.state.mappings || {}).map(m => m.docId).filter(Boolean);
+            const ids = new Set();
+            for (const m of Object.values(this.state.mappings || {})) {
+              for (const inst of m.instances || []) {
+                if (inst?.docId) ids.add(inst.docId);
+              }
+            }
             const results = [];
             for (const id of ids) {
               try { await this.sync.pullFromSiyuan(id); results.push({ id, ok: true }); }
@@ -101,6 +106,12 @@ export default class extends Plugin {
             return results;
           },
           simulateWsEvent: (docId) => this.sync.schedulePull(docId),
+          reconcile: () => this.sync.reconcile(),
+          dump: () => ({
+            activeNotebookId: this.state.activeNotebookId,
+            notebooks: this.state.notebooks,
+            mappings: this.state.mappings,
+          }),
         };
         this.log('window.__mdSync ready (debug)');
       }
@@ -133,6 +144,9 @@ export default class extends Plugin {
       confirmCallback: () => this.state.save(),
     });
 
+    // ============================================================
+    // 笔记本下拉框（决定下面的文件夹列表跟哪个笔记本挂钩）
+    // ============================================================
     setting.addItem({
       title: t('targetNotebook'),
       direction: 'row',
@@ -140,88 +154,51 @@ export default class extends Plugin {
       createActionElement: () => {
         const sel = document.createElement('select');
         sel.className = 'b3-select';
-        const current = this.state.notebookId;
-        if (!this.notebooks.some(nb => nb.id === current)) {
-          if (current) {
-            const opt = document.createElement('option');
-            opt.value = current;
-            opt.textContent = `(不可用) ${current.slice(0, 8)}…`;
-            opt.selected = true;
-            sel.appendChild(opt);
+        this._renderNotebookSelect(sel);
+        sel.addEventListener('change', async () => {
+          this.state.setActive(sel.value);
+          await this.state.save();
+          // 切换笔记本：刷新下面的文件夹列表 + 根 hpath 输入框
+          this._renderFolderList();
+          this._renderRootHpathInput();
+          // 重新启动 watcher 监听新笔记本的文件夹
+          await this.stopWatcher();
+          if (this.state.allWatched().length && this.state.importOnChange) {
+            this.startWatcher();
           }
-        }
-        this.notebooks.forEach(nb => {
-          const opt = document.createElement('option');
-          opt.value = nb.id;
-          opt.textContent = nb.closed ? `${nb.name}（已关闭）` : nb.name;
-          if (nb.id === current) opt.selected = true;
-          sel.appendChild(opt);
-        });
-        sel.addEventListener('change', () => {
-          this.state.notebookId = sel.value;
         });
         return sel;
       },
     });
 
-    const hpathInput = document.createElement('input');
-    hpathInput.className = 'b3-text-field fn__size200';
-    hpathInput.value = this.state.rootHpath;
-    hpathInput.addEventListener('change', () => {
-      this.state.rootHpath = hpathInput.value || '/inbox';
-    });
+    // ============================================================
+    // 根 hpath（per-notebook，跟着 activeNotebookId 走）
+    // ============================================================
+    this._hpathInput = document.createElement('input');
+    this._hpathInput.className = 'b3-text-field fn__size200';
+    this._renderRootHpathInput();
     setting.addItem({
       title: t('rootHpath'),
       direction: 'row',
       description: t('rootHpathHint'),
-      actionElement: hpathInput,
+      actionElement: this._hpathInput,
     });
 
-    const folderContainer = document.createElement('div');
-    const renderFolders = () => {
-      folderContainer.innerHTML = '';
-      const list = document.createElement('div');
-      list.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
-      this.state.folders.forEach((f, i) => {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;gap:4px;align-items:center;';
-        const span = document.createElement('span');
-        span.textContent = f.path;
-        span.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-        const btn = document.createElement('button');
-        btn.textContent = '✕';
-        btn.className = 'b3-button b3-button--outline fn__size100';
-        btn.addEventListener('click', async () => {
-          this.state.folders.splice(i, 1);
-          await this.state.save();
-          renderFolders();
-        });
-        row.appendChild(span);
-        row.appendChild(btn);
-        list.appendChild(row);
-      });
-      const addBtn = document.createElement('button');
-      addBtn.textContent = '+ ' + t('addFolder');
-      addBtn.className = 'b3-button b3-button--outline fn__size200';
-      addBtn.addEventListener('click', async () => {
-        const p = await inputDialog(t('addFolderTitle'), t('addFolderPrompt'), '/Users/me/notes');
-        if (p) {
-          this.state.folders.push({ path: p, label: p });
-          await this.state.save();
-          renderFolders();
-        }
-      });
-      list.appendChild(addBtn);
-      folderContainer.appendChild(list);
-    };
-    renderFolders();
+    // ============================================================
+    // 监听文件夹列表（per-notebook，跟着 activeNotebookId 走）
+    // ============================================================
+    this._folderContainer = document.createElement('div');
+    this._renderFolderList();
     setting.addItem({
       title: t('watchedFolders'),
       direction: 'row',
       description: t('noFolders'),
-      actionElement: folderContainer,
+      actionElement: this._folderContainer,
     });
 
+    // ============================================================
+    // 全局开关
+    // ============================================================
     const ialCheckbox = document.createElement('input');
     ialCheckbox.type = 'checkbox';
     ialCheckbox.className = 'b3-switch fn__flex-center';
@@ -251,6 +228,132 @@ export default class extends Plugin {
     });
 
     this.setting = setting;
+  }
+
+  _renderNotebookSelect(sel) {
+    sel.innerHTML = '';
+    const current = this.state.activeNotebookId;
+    // 如果当前 active 不在可见列表里，给个 (不可用) 占位项，避免 dropdown 空着
+    if (current && !this.notebooks.some(nb => nb.id === current)) {
+      const opt = document.createElement('option');
+      opt.value = current;
+      opt.textContent = `(不可用) ${current.slice(0, 8)}…`;
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+    // 如果没有任何 active，强制显示一个空选项 + 提示文案
+    if (!current) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '— 请先选择一个笔记本 —';
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+    for (const nb of this.notebooks) {
+      const opt = document.createElement('option');
+      opt.value = nb.id;
+      opt.textContent = nb.closed ? `${nb.name}（已关闭）` : nb.name;
+      if (nb.id === current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
+
+  _renderRootHpathInput() {
+    const cfg = this.state.getActive();
+    this._hpathInput.value = cfg?.rootHpath || '/inbox';
+    this._hpathInput.onchange = () => {
+      const cur = this.state.ensureActive();
+      if (cur) cur.rootHpath = this._hpathInput.value || '/inbox';
+    };
+  }
+
+  _renderFolderList() {
+    if (!this._folderContainer) return;
+    this._folderContainer.innerHTML = '';
+    const cfg = this.state.getActive();
+    const folders = cfg?.folders || [];
+    const list = document.createElement('div');
+    list.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+    folders.forEach((f, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:4px;align-items:center;';
+      const span = document.createElement('span');
+      span.textContent = f.path;
+      span.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      const btn = document.createElement('button');
+      btn.textContent = '✕';
+      btn.className = 'b3-button b3-button--outline fn__size100';
+      btn.addEventListener('click', async () => {
+        const cur = this.state.ensureActive();
+        cur.folders.splice(i, 1);
+        await this.state.save();
+        this._renderFolderList();
+        // 重新启动 watcher
+        await this.stopWatcher();
+        if (this.state.allWatched().length && this.state.importOnChange) {
+          this.startWatcher();
+        }
+      });
+      row.appendChild(span);
+      row.appendChild(btn);
+      list.appendChild(row);
+    });
+    const addBtn = document.createElement('button');
+    addBtn.textContent = '+ ' + t('addFolder');
+    addBtn.className = 'b3-button b3-button--outline fn__size200';
+    addBtn.addEventListener('click', async () => {
+      const cur = this.state.ensureActive();
+      if (!cur) {
+        this.notify('请先在上方下拉框中选择一个笔记本', 'error');
+        return;
+      }
+      const p = await inputDialog(t('addFolderTitle'), t('addFolderPrompt'), '/Users/me/notes');
+      if (p) {
+        cur.folders.push({ path: p, label: p });
+        await this.state.save();
+        this._renderFolderList();
+        // 启动 watcher 监听新文件夹
+        if (this.state.importOnChange) {
+          await this.stopWatcher();
+          this.startWatcher();
+        }
+      }
+    });
+    list.appendChild(addBtn);
+
+    // 统计行
+    const stats = document.createElement('div');
+    stats.style.cssText = 'font-size:12px;color:var(--b3-theme-on-surface-light);margin-top:4px;';
+    const updateStats = () => {
+      const cfg = this.state.getActive();
+      const folderCount = cfg?.folders?.length || 0;
+      const fileCount = Object.values(this.state.mappings).filter(m =>
+        m.instances.some(i => i.notebookId === this.state.activeNotebookId)
+      ).length;
+      stats.textContent = `当前笔记本：${folderCount} 个文件夹，已映射 ${fileCount} 个 .md`;
+    };
+    updateStats();
+
+    // "立即对账" 按钮
+    const reconcileBtn = document.createElement('button');
+    reconcileBtn.textContent = '🔄 ' + t('cmdReconcile');
+    reconcileBtn.className = 'b3-button b3-button--outline fn__size200';
+    reconcileBtn.style.marginTop = '8px';
+    reconcileBtn.addEventListener('click', async () => {
+      reconcileBtn.disabled = true;
+      reconcileBtn.textContent = '⏳ ' + t('reconciling');
+      try {
+        await this.sync.reconcile();
+        updateStats();
+      } finally {
+        reconcileBtn.disabled = false;
+        reconcileBtn.textContent = '🔄 ' + t('cmdReconcile');
+      }
+    });
+    list.appendChild(reconcileBtn);
+    list.appendChild(stats);
+
+    this._folderContainer.appendChild(list);
   }
 
   startWatcher() {
