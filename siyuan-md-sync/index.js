@@ -102,6 +102,7 @@ var State = class {
     this.folders = [];
     this.writeBackIAL = true;
     this.importOnChange = true;
+    this.bidirectional = true;
     this.mappings = {};
   }
   async load() {
@@ -113,6 +114,7 @@ var State = class {
         this.folders = raw.folders || [];
         this.writeBackIAL = raw.writeBackIAL !== false;
         this.importOnChange = raw.importOnChange !== false;
+        this.bidirectional = raw.bidirectional !== false;
         this.mappings = raw.mappings || {};
       }
     } catch (e) {
@@ -128,6 +130,7 @@ var State = class {
         folders: this.folders,
         writeBackIAL: this.writeBackIAL,
         importOnChange: this.importOnChange,
+        bidirectional: this.bidirectional,
         mappings: this.mappings
       });
     } catch (e) {
@@ -176,6 +179,8 @@ var messages = {
     rootHpathHint: "\u4F8B\u5982\u586B /inbox\uFF1B\u76D1\u542C\u6587\u4EF6\u5939\u91CC\u7684 foo/bar.md \u4F1A\u53D8\u6210 /inbox/foo/bar",
     writeBackIAL: "\u5C06\u601D\u6E90\u751F\u6210\u7684 IAL \u5757 ID \u5199\u56DE .md \u6E90\u6587\u4EF6",
     writeBackIALHint: "\u5173\u95ED\u540E .md \u4FDD\u6301\u5E72\u51C0\uFF0C\u4F46\u5757\u5F15\u7528 ((xxx)) \u4F1A\u5931\u6548",
+    bidirectional: "\u53CC\u5411\u540C\u6B65\uFF1A\u601D\u6E90\u91CC\u4FEE\u6539\u4E5F\u81EA\u52A8\u5199\u56DE .md",
+    bidirectionalHint: '\u5173\u95ED\u540E\u53EA\u80FD\u4ECE .md \u63A8\u5230\u601D\u6E90\uFF0C\u601D\u6E90\u91CC\u6539\u4E86\u9700\u8981\u624B\u52A8"\u5BFC\u51FA\u5F53\u524D\u6587\u6863"',
     importOnChange: "\u6587\u4EF6\u6539\u52A8\u65F6\u81EA\u52A8\u5BFC\u5165",
     cmdImportFile: "\u5BFC\u5165 Markdown \u6587\u4EF6",
     cmdImportFolder: "\u5BFC\u5165 Markdown \u6587\u4EF6\u5939",
@@ -217,6 +222,8 @@ var messages = {
     rootHpathHint: "e.g. /inbox; watched/foo/bar.md becomes /inbox/foo/bar",
     writeBackIAL: "Write back Siyuan IAL block IDs into the source .md",
     writeBackIALHint: "Off keeps .md clean, but breaks block references ((xxx))",
+    bidirectional: "Bidirectional: Siyuan edits auto-write back to .md",
+    bidirectionalHint: 'Off: only push fs \u2192 Siyuan. Use "Export current document" for Siyuan \u2192 fs.',
     importOnChange: "Auto-import on file change",
     cmdImportFile: "Import Markdown file",
     cmdImportFolder: "Import Markdown folder",
@@ -271,6 +278,7 @@ var Sync = class {
     this.state = state;
     this.notify = opts.notify || ((msg, type) => (0, import_siyuan2.showMessage)(msg, 3e3, type || "info"));
     this.log = opts.log || console.log;
+    this._pullTimers = {};
   }
   /** 给定一个 .md 的绝对路径，判断它归属哪个监听文件夹。 */
   findWatchedFolder(absPath) {
@@ -433,6 +441,84 @@ var Sync = class {
       this.notify(t("error") + ": " + e.message, "error");
       return false;
     }
+  }
+  // ============================================================
+  // siyuan → fs（事件驱动的反向同步）
+  // ============================================================
+  /**
+   * 监听 ws-main 事件：检查消息里有没有我们追踪的 doc id，有就排程一次 pull。
+   * 思路：把所有追踪到的 docId 拼成一个集合，扫描消息 data 的字符串表示，
+   * 任何 docId 子串命中就排程。
+   */
+  onWebSocketMessage(msg) {
+    if (this.state.bidirectional === false) return;
+    if (!msg || !msg.data) return;
+    const trackedIds = /* @__PURE__ */ new Set();
+    for (const info of Object.values(this.state.mappings || {})) {
+      if (info?.docId) trackedIds.add(info.docId);
+    }
+    if (trackedIds.size === 0) return;
+    const dataStr = this._safeStringify(msg.data);
+    for (const docId of trackedIds) {
+      if (dataStr.includes(docId)) {
+        this.schedulePull(docId);
+      }
+    }
+  }
+  _safeStringify(obj) {
+    try {
+      return JSON.stringify(obj);
+    } catch {
+      return "";
+    }
+  }
+  /** Debounce: 800ms 内多次触发同一 docId 只 pull 一次。 */
+  schedulePull(docId) {
+    if (this._pullTimers[docId]) clearTimeout(this._pullTimers[docId]);
+    this._pullTimers[docId] = setTimeout(() => {
+      delete this._pullTimers[docId];
+      this.pullFromSiyuan(docId).catch((e) => this.log("[pull] err", docId, e.message));
+    }, 800);
+  }
+  /**
+   * 把思源文档的最新 kramdown 写回对应的 .md 文件。
+   * 防回声关键：写完后把 mdHash 和 syHash 都更新成新 hash，
+   * 这样 fs.watch → importFile 时 hash 匹配会跳过，不会重新 import 思源。
+   */
+  async pullFromSiyuan(docId) {
+    const mapping = this.state.byDocId(docId);
+    if (!mapping) {
+      this.log("[pull] docId \u672A\u8FFD\u8E2A:", docId);
+      return;
+    }
+    let kramdown;
+    try {
+      kramdown = await this.api.getDocKramdown(docId);
+    } catch (e) {
+      this.log("[pull] getDocKramdown \u5931\u8D25", docId, e.message);
+      return;
+    }
+    const newHash = sha256(kramdown);
+    const existing = this.state.get(mapping.path);
+    if (existing && existing.syHash === newHash) {
+      this.log("[pull] syHash \u4E00\u81F4\uFF0C\u65E0\u9700\u5199\u56DE:", mapping.path);
+      return;
+    }
+    try {
+      await import_promises.default.writeFile(mapping.path, kramdown, "utf-8");
+    } catch (e) {
+      this.log("[pull] writeFile \u5931\u8D25", mapping.path, e.message);
+      return;
+    }
+    this.state.set(mapping.path, {
+      ...existing,
+      docId,
+      hpath: existing?.hpath || "",
+      mdHash: newHash,
+      syHash: newHash
+    });
+    await this.state.save();
+    this.log("[pull] OK", mapping.path, "\u2190", docId);
   }
   // ============================================================
   // 对账（手动触发或启动时调用）
@@ -688,6 +774,9 @@ var index_default = class extends import_siyuan5.Plugin {
       this.initSettings();
       this.eventBus.on("opened-notebook", () => this.refreshNotebooks());
       this.eventBus.on("closed-notebook", () => this.refreshNotebooks());
+      this.eventBus.on("ws-main", (e) => {
+        this.sync.onWebSocketMessage(e?.detail);
+      });
       registerCommands(this);
       if (this.state.folders?.length && this.state.importOnChange) {
         this.startWatcher();
@@ -821,6 +910,19 @@ var index_default = class extends import_siyuan5.Plugin {
       direction: "row",
       description: t("writeBackIALHint"),
       actionElement: ialCheckbox
+    });
+    const bidiCheckbox = document.createElement("input");
+    bidiCheckbox.type = "checkbox";
+    bidiCheckbox.className = "b3-switch fn__flex-center";
+    bidiCheckbox.checked = this.state.bidirectional !== false;
+    bidiCheckbox.addEventListener("change", () => {
+      this.state.bidirectional = bidiCheckbox.checked;
+    });
+    setting.addItem({
+      title: t("bidirectional"),
+      direction: "row",
+      description: t("bidirectionalHint"),
+      actionElement: bidiCheckbox
     });
     this.setting = setting;
   }

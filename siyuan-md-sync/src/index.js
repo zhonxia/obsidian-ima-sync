@@ -66,6 +66,10 @@ export default class extends Plugin {
       this.eventBus.on('opened-notebook', () => this.refreshNotebooks());
       this.eventBus.on('closed-notebook', () => this.refreshNotebooks());
 
+      this.eventBus.on('ws-main', (e) => {
+        this.sync.onWebSocketMessage(e?.detail);
+      });
+
       registerCommands(this);
 
       if (this.state.folders?.length && this.state.importOnChange) {
@@ -209,6 +213,20 @@ export default class extends Plugin {
       direction: 'row',
       description: t('writeBackIALHint'),
       actionElement: ialCheckbox,
+    });
+
+    const bidiCheckbox = document.createElement('input');
+    bidiCheckbox.type = 'checkbox';
+    bidiCheckbox.className = 'b3-switch fn__flex-center';
+    bidiCheckbox.checked = this.state.bidirectional !== false;
+    bidiCheckbox.addEventListener('change', () => {
+      this.state.bidirectional = bidiCheckbox.checked;
+    });
+    setting.addItem({
+      title: t('bidirectional'),
+      direction: 'row',
+      description: t('bidirectionalHint'),
+      actionElement: bidiCheckbox,
     });
 
     this.setting = setting;

@@ -8,6 +8,7 @@ export class State {
     this.folders = [];
     this.writeBackIAL = true;
     this.importOnChange = true;
+    this.bidirectional = true;
     this.mappings = {};
   }
 
@@ -20,6 +21,7 @@ export class State {
         this.folders = raw.folders || [];
         this.writeBackIAL = raw.writeBackIAL !== false;
         this.importOnChange = raw.importOnChange !== false;
+        this.bidirectional = raw.bidirectional !== false;
         this.mappings = raw.mappings || {};
       }
     } catch (e) {
@@ -36,6 +38,7 @@ export class State {
         folders: this.folders,
         writeBackIAL: this.writeBackIAL,
         importOnChange: this.importOnChange,
+        bidirectional: this.bidirectional,
         mappings: this.mappings,
       });
     } catch (e) {

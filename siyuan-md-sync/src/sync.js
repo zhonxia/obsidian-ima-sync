@@ -48,6 +48,7 @@ export class Sync {
     this.state = state;
     this.notify = opts.notify || ((msg, type) => showMessage(msg, 3000, type || 'info'));
     this.log = opts.log || console.log;
+    this._pullTimers = {};
   }
 
   /** 给定一个 .md 的绝对路径，判断它归属哪个监听文件夹。 */
@@ -223,6 +224,85 @@ export class Sync {
       this.notify(t('error') + ': ' + e.message, 'error');
       return false;
     }
+  }
+
+  // ============================================================
+  // siyuan → fs（事件驱动的反向同步）
+  // ============================================================
+
+  /**
+   * 监听 ws-main 事件：检查消息里有没有我们追踪的 doc id，有就排程一次 pull。
+   * 思路：把所有追踪到的 docId 拼成一个集合，扫描消息 data 的字符串表示，
+   * 任何 docId 子串命中就排程。
+   */
+  onWebSocketMessage(msg) {
+    if (this.state.bidirectional === false) return;
+    if (!msg || !msg.data) return;
+    const trackedIds = new Set();
+    for (const info of Object.values(this.state.mappings || {})) {
+      if (info?.docId) trackedIds.add(info.docId);
+    }
+    if (trackedIds.size === 0) return;
+    const dataStr = this._safeStringify(msg.data);
+    for (const docId of trackedIds) {
+      if (dataStr.includes(docId)) {
+        this.schedulePull(docId);
+      }
+    }
+  }
+
+  _safeStringify(obj) {
+    try { return JSON.stringify(obj); } catch { return ''; }
+  }
+
+  /** Debounce: 800ms 内多次触发同一 docId 只 pull 一次。 */
+  schedulePull(docId) {
+    if (this._pullTimers[docId]) clearTimeout(this._pullTimers[docId]);
+    this._pullTimers[docId] = setTimeout(() => {
+      delete this._pullTimers[docId];
+      this.pullFromSiyuan(docId).catch(e => this.log('[pull] err', docId, e.message));
+    }, 800);
+  }
+
+  /**
+   * 把思源文档的最新 kramdown 写回对应的 .md 文件。
+   * 防回声关键：写完后把 mdHash 和 syHash 都更新成新 hash，
+   * 这样 fs.watch → importFile 时 hash 匹配会跳过，不会重新 import 思源。
+   */
+  async pullFromSiyuan(docId) {
+    const mapping = this.state.byDocId(docId);
+    if (!mapping) {
+      this.log('[pull] docId 未追踪:', docId);
+      return;
+    }
+    let kramdown;
+    try {
+      kramdown = await this.api.getDocKramdown(docId);
+    } catch (e) {
+      this.log('[pull] getDocKramdown 失败', docId, e.message);
+      return;
+    }
+    const newHash = sha256(kramdown);
+    const existing = this.state.get(mapping.path);
+    if (existing && existing.syHash === newHash) {
+      this.log('[pull] syHash 一致，无需写回:', mapping.path);
+      return;
+    }
+    try {
+      await fs.writeFile(mapping.path, kramdown, 'utf-8');
+    } catch (e) {
+      this.log('[pull] writeFile 失败', mapping.path, e.message);
+      return;
+    }
+    this.state.set(mapping.path, {
+      ...existing,
+      docId,
+      hpath: existing?.hpath || '',
+      mdHash: newHash,
+      syHash: newHash,
+    });
+    await this.state.save();
+    this.log('[pull] OK', mapping.path, '←', docId);
   }
 
   // ============================================================
