@@ -1,0 +1,30 @@
+{
+  "name": "siyuan-md-sync",
+  "author": "you",
+  "url": "https://github.com/you/siyuan-md-sync",
+  "version": "0.1.0",
+  "minAppVersion": "3.0.0",
+  "displayName": {
+    "default": "Markdown Folder Sync",
+    "zh_CN": "Markdown 文件夹同步"
+  },
+  "description": {
+    "default": "Sync .md files in watched folders with a Siyuan notebook. Pushes fs changes in, pulls Siyuan edits out on demand.",
+    "zh_CN": "在监听的 Markdown 文件夹和思源笔记本之间同步。文件改动自动推入思源，思源编辑可手动导出。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh_CN": "README.md"
+  },
+  "i18n": [
+    "zh_CN",
+    "en_US"
+  ],
+  "funding": {},
+  "keywords": [
+    "markdown",
+    "sync",
+    "ai",
+    "obsidian-compatible"
+  ]
+}

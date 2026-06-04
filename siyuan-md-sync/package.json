@@ -1,0 +1,13 @@
+{
+  "name": "siyuan-md-sync",
+  "version": "0.1.0",
+  "description": "Siyuan plugin: sync markdown folders with a notebook.",
+  "main": "index.js",
+  "scripts": {
+    "build": "esbuild src/index.js --bundle --platform=node --format=cjs --target=es2020 --outfile=index.js --external:siyuan && node -e \"const fs=require('fs');const f='index.js';let s=fs.readFileSync(f,'utf8');s+='\\nmodule.exports=module.exports.default;\\n';fs.writeFileSync(f,s);\"",
+    "dev": "esbuild src/index.js --bundle --platform=node --format=cjs --target=es2020 --outfile=index.js --external:siyuan --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0"
+  }
+}
