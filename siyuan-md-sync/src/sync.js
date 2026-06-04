@@ -17,14 +17,18 @@ import { t } from './i18n.js';
 const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
 
 /**
- * 把思源 kramdown 里的 IAL 行剥掉，让 .md 干净可读。
- * IAL 形如 `{: id="20240101-abc1234" updated="20240101"}`，
- * 总是独占一行（块级），doc 末尾的那行 `{: ... type="doc" ...}` 也一样。
+ * 把思源 kramdown 里的 IAL 剥掉，让 .md 干净可读。
+ * IAL 形如 `{: id="20240101-abc1234" updated="20240101"}`，两种位置：
+ *   - 独占一行：    `text\n{: id="..."}\n` → 直接删 IAL 行
+ *   - 行内末尾：    `- text{: id="..."}`   → 删掉 `{: ...}` 本身
+ * doc 末尾的 `{: ... type="doc" ...}` 也是独占一行。
  */
 function stripIal(text) {
-  // 删掉 IAL 行本身
+  // 删掉独占一行的 IAL（包括它自己的换行）
   let out = text.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '');
-  // 删掉连续空行（避免留下两个换行）
+  // 删掉行内末尾的 IAL（紧跟在普通字符后面，没有换行）
+  out = out.replace(/\{:[^}]*\}/g, '');
+  // 删掉连续空行
   out = out.replace(/\n{3,}/g, '\n\n');
   // 去尾部多余空白
   out = out.replace(/\s+$/, '');
@@ -66,10 +70,11 @@ export class Sync {
     this._pullTimers = {};
   }
 
-  /** 给定一个 .md 的绝对路径，判断它归属哪个监听文件夹。 */
+  /** 给定一个 .md 的绝对路径，判断它归属哪个笔记本的哪个监听文件夹。 */
   findWatchedFolder(absPath) {
-    for (const f of this.state.folders) {
-      if (absPath.startsWith(f.path + path.sep) || absPath === f.path) return f;
+    for (const item of this.state.allWatched()) {
+      const f = item.folder;
+      if (absPath.startsWith(f.path + path.sep) || absPath === f.path) return item;
     }
     return null;
   }
@@ -83,10 +88,12 @@ export class Sync {
    * @returns {string|null} 新建/更新后的 doc id，失败为 null
    */
   async importFile(absPath, { force = false } = {}) {
-    if (!this.state.notebookId) {
-      this.log('未配置目标笔记本，跳过');
+    const watched = this.findWatchedFolder(absPath);
+    if (!watched) {
+      this.log('[import] 路径不在任何监听目录内:', absPath);
       return null;
     }
+    const { notebookId, folder, rootHpath } = watched;
     let content;
     try {
       content = await fs.readFile(absPath, 'utf-8');
@@ -101,23 +108,18 @@ export class Sync {
       return existing.docId;
     }
 
-    const folder = this.findWatchedFolder(absPath);
-    if (!folder) {
-      this.log('[import] 路径不在任何监听目录内:', absPath);
-      return null;
-    }
     const rel = relToRoot(absPath, [folder]);
-    const hpath = toHPath(this.state.rootHpath, rel);
+    const hpath = toHPath(rootHpath, rel);
 
     try {
       // 先删旧（如果存在），否则新文档的 IAL 块 ID 不会被思源复用
       if (existing?.docId) {
         const storage = await this.api.getDocStoragePath(existing.docId);
         if (storage) {
-          await this.api.removeDoc(this.state.notebookId, storage);
+          await this.api.removeDoc(notebookId, storage);
         }
       }
-      const newId = await this.api.createDocWithMd(this.state.notebookId, hpath, content);
+      const newId = await this.api.createDocWithMd(notebookId, hpath, content);
       if (!newId) throw new Error('createDocWithMd 未返回 id');
 
       // 回读以拿到思源规范化后的内容（带 IAL）
@@ -134,11 +136,12 @@ export class Sync {
       this.state.set(absPath, {
         docId: newId,
         hpath,
+        notebookId,
         mdHash: fileOnDiskHash,
         syHash,
       });
       this.state.save();
-      this.log('[import] OK', absPath, '→', hpath);
+      this.log('[import] OK', absPath, '→', hpath, '(in', notebookId.slice(0, 8) + '...)');
       return newId;
     } catch (e) {
       this.log('[import] 失败', absPath, e.message);
@@ -151,10 +154,15 @@ export class Sync {
   async deleteFile(absPath) {
     const existing = this.state.get(absPath);
     if (!existing?.docId) return;
+    const notebookId = existing.notebookId || this.state.activeNotebookId;
+    if (!notebookId) {
+      this.log('[delete] 找不到归属笔记本，跳过:', absPath);
+      return;
+    }
     try {
       const storage = await this.api.getDocStoragePath(existing.docId);
       if (storage) {
-        await this.api.removeDoc(this.state.notebookId, storage);
+        await this.api.removeDoc(notebookId, storage);
         this.log('[delete] OK', absPath);
       }
     } catch (e) {
@@ -332,9 +340,14 @@ export class Sync {
   async reconcile() {
     this.log('[reconcile] start');
     let changed = 0;
-    for (const folder of this.state.folders) {
+    const watched = this.state.allWatched();
+    if (watched.length === 0) {
+      this.notify('没有配置任何监听文件夹');
+      return 0;
+    }
+    for (const item of watched) {
       try {
-        const files = await this.walkMd(folder.path);
+        const files = await this.walkMd(item.folder.path);
         for (const f of files) {
           const content = await fs.readFile(f, 'utf-8').catch(() => null);
           if (content == null) continue;
@@ -346,7 +359,7 @@ export class Sync {
           }
         }
       } catch (e) {
-        this.log('[reconcile] folder error', folder.path, e.message);
+        this.log('[reconcile] folder error', item.folder.path, e.message);
       }
     }
     this.notify(`${t('reconcileDone')}: ${changed}`);

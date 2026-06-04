@@ -21,12 +21,17 @@ export function registerCommands(plugin) {
     callback: async () => {
       const filePath = await pickFile();
       if (!filePath) return;
-      // 用户从任意位置选的，需把它临时加进 folders 然后立即导入
-      // 简化方案：直接调用 importFile，让其匹配监听列表
-      if (!state.folders.some(f => filePath.startsWith(f.path + '/') || filePath === f.path)) {
-        // 不在监听列表内，临时加
-        state.folders.push({ path: path.dirname(filePath), label: '临时' });
-        state.save();
+      // 用户从任意位置选的：临时挂到当前活跃笔记本下
+      if (!state.activeNotebookId) {
+        showMessage('请先在插件设置里选择一个笔记本', 3000, 'error');
+        return;
+      }
+      const watched = state.allWatched();
+      if (!watched.some(w => filePath.startsWith(w.folder.path + '/') || filePath === w.folder.path)) {
+        const cur = state.ensureActive();
+        cur.folders.push({ path: path.dirname(filePath), label: '临时' });
+        await state.save();
+        await plugin.stopWatcher();
         plugin.startWatcher();
       }
       const id = await sync.importFile(filePath);
@@ -42,10 +47,15 @@ export function registerCommands(plugin) {
     callback: async () => {
       const folderPath = await pickDirectory();
       if (!folderPath) return;
-      // 临时加入监听
-      if (!state.folders.some(f => f.path === folderPath)) {
-        state.folders.push({ path: folderPath, label: folderPath });
-        state.save();
+      if (!state.activeNotebookId) {
+        showMessage('请先在插件设置里选择一个笔记本', 3000, 'error');
+        return;
+      }
+      const cur = state.ensureActive();
+      if (!cur.folders.some(f => f.path === folderPath)) {
+        cur.folders.push({ path: folderPath, label: folderPath });
+        await state.save();
+        await plugin.stopWatcher();
         plugin.startWatcher();
       }
       const n = await sync.importFolder(folderPath);
@@ -112,7 +122,7 @@ export function registerCommands(plugin) {
       const fs = require('fs/promises');
       const crypto = require('crypto');
       const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
-      const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
+      const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, '').replace(/\{:[^}]*\}/g, '').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
       let n = 0;
       for (const [absPath, info] of Object.entries(state.mappings || {})) {
         try {

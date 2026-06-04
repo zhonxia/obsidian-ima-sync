@@ -20,11 +20,13 @@ export class Watcher {
   }
 
   start() {
-    if (!this.state.folders?.length) return;
-    for (const folder of this.state.folders) {
-      this._watchOne(folder.path);
+    const watched = this.state.allWatched();
+    if (!watched.length) return;
+    for (const item of watched) {
+      this._watchOne(item.folder.path);
     }
-    this.notify(`${t('watching')}: ${this.state.folders.length} 个`);
+    const nbCount = new Set(watched.map(w => w.notebookId)).size;
+    this.notify(`${t('watching')}: ${watched.length} 个文件夹，${nbCount} 个笔记本`);
     // 首次自启动自动对账
     this.sync.reconcile().catch(e => this.log('[watcher] reconcile err', e));
   }

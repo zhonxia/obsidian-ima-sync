@@ -94,12 +94,12 @@ var Api = class {
 
 // src/state.js
 var STORAGE_KEY = "state";
+var SCHEMA_VERSION = 2;
 var State = class {
   constructor(plugin) {
     this.plugin = plugin;
-    this.notebookId = "";
-    this.rootHpath = "/inbox";
-    this.folders = [];
+    this.notebooks = {};
+    this.activeNotebookId = "";
     this.writeBackIAL = false;
     this.importOnChange = true;
     this.bidirectional = true;
@@ -108,26 +108,52 @@ var State = class {
   async load() {
     try {
       const raw = await this.plugin.loadData(STORAGE_KEY);
-      if (raw) {
-        this.notebookId = raw.notebookId || "";
-        this.rootHpath = raw.rootHpath || "/inbox";
-        this.folders = raw.folders || [];
-        this.writeBackIAL = raw.writeBackIAL === true;
-        this.importOnChange = raw.importOnChange !== false;
-        this.bidirectional = raw.bidirectional !== false;
-        this.mappings = raw.mappings || {};
+      if (!raw) return;
+      if (!raw.schemaVersion || raw.schemaVersion < 2) {
+        this._migrateV1(raw);
+      } else {
+        this.notebooks = raw.notebooks || {};
+        this.activeNotebookId = raw.activeNotebookId || "";
+      }
+      this.writeBackIAL = raw.writeBackIAL === true;
+      this.importOnChange = raw.importOnChange !== false;
+      this.bidirectional = raw.bidirectional !== false;
+      this.mappings = raw.mappings || {};
+      if (this.activeNotebookId) {
+        for (const info of Object.values(this.mappings)) {
+          if (!info.notebookId) info.notebookId = this.activeNotebookId;
+        }
+      }
+      if (this.activeNotebookId && !this.notebooks[this.activeNotebookId]) {
+        this.activeNotebookId = Object.keys(this.notebooks)[0] || "";
       }
     } catch (e) {
       console.warn("[state] load failed:", e);
     }
   }
+  /**
+   * v1 → v2 数据迁移：把全局的 {notebookId, rootHpath, folders}
+   * 挪到 notebooks[oldNotebookId] 下面。
+   */
+  _migrateV1(raw) {
+    const oldNbId = raw.notebookId || "";
+    const oldFolders = raw.folders || [];
+    const oldRootHpath = raw.rootHpath || "/inbox";
+    if (oldNbId) {
+      this.notebooks[oldNbId] = {
+        folders: oldFolders,
+        rootHpath: oldRootHpath
+      };
+      this.activeNotebookId = oldNbId;
+    }
+    console.log("[state] migrated v1 \u2192 v2, notebook count:", Object.keys(this.notebooks).length);
+  }
   async save() {
     try {
       await this.plugin.saveData(STORAGE_KEY, {
-        version: 1,
-        notebookId: this.notebookId,
-        rootHpath: this.rootHpath,
-        folders: this.folders,
+        schemaVersion: SCHEMA_VERSION,
+        activeNotebookId: this.activeNotebookId,
+        notebooks: this.notebooks,
         writeBackIAL: this.writeBackIAL,
         importOnChange: this.importOnChange,
         bidirectional: this.bidirectional,
@@ -137,6 +163,32 @@ var State = class {
       console.warn("[state] save failed:", e);
     }
   }
+  // ============================================================
+  // 查询/修改当前激活笔记本的配置
+  // ============================================================
+  /** 返回当前激活笔记本的配置对象（不存在则返回 null）。 */
+  getActive() {
+    if (!this.activeNotebookId) return null;
+    return this.notebooks[this.activeNotebookId] || null;
+  }
+  /** 确保当前激活笔记本存在配置项（懒创建）。 */
+  ensureActive() {
+    if (!this.activeNotebookId) return null;
+    if (!this.notebooks[this.activeNotebookId]) {
+      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "/inbox" };
+    }
+    return this.notebooks[this.activeNotebookId];
+  }
+  /** 切换 activeNotebookId。会停止并重启 watcher。 */
+  setActive(notebookId) {
+    this.activeNotebookId = notebookId || "";
+    if (this.activeNotebookId && !this.notebooks[this.activeNotebookId]) {
+      this.notebooks[this.activeNotebookId] = { folders: [], rootHpath: "/inbox" };
+    }
+  }
+  // ============================================================
+  // mappings（按 .md 路径）
+  // ============================================================
   get(absPath) {
     return this.mappings[absPath] || null;
   }
@@ -151,6 +203,20 @@ var State = class {
       if (v.docId === docId) return { path: k, ...v };
     }
     return null;
+  }
+  // ============================================================
+  // 跨所有笔记本：用于 reconcile / watcher 遍历
+  // ============================================================
+  /** 返回 [{notebookId, folder, rootHpath}, ...] 所有笔记本的所有监听文件夹。 */
+  allWatched() {
+    const out = [];
+    for (const [nbId, cfg] of Object.entries(this.notebooks)) {
+      const rootHpath = cfg.rootHpath || "/inbox";
+      for (const folder of cfg.folders || []) {
+        out.push({ notebookId: nbId, folder, rootHpath });
+      }
+    }
+    return out;
   }
 };
 
@@ -174,8 +240,8 @@ var messages = {
     watchedFolders: "\u76D1\u542C\u6587\u4EF6\u5939",
     noFolders: "\u672C\u5730\u8981\u76D1\u542C\u7684 Markdown \u6587\u4EF6\u5939\uFF08\u53EF\u591A\u4E2A\uFF09",
     targetNotebook: "\u76EE\u6807\u7B14\u8BB0\u672C",
-    targetNotebookDesc: "\u540C\u6B65\u540E\u7684\u6587\u6863\u5C06\u521B\u5EFA\u5728\u8FD9\u4E2A\u7B14\u8BB0\u672C\u91CC",
-    rootHpath: "\u76EE\u6807 HPath\uFF08\u7B14\u8BB0\u672C\u5185\u7684\u6839\u8DEF\u5F84\uFF09",
+    targetNotebookDesc: '\u4E0B\u9762\u7684"\u76D1\u542C\u6587\u4EF6\u5939"\u548C"\u76EE\u6807 HPath"\u90FD\u9488\u5BF9\u6B64\u7B14\u8BB0\u672C\u3002\u5207\u6362\u7B14\u8BB0\u672C \u2192 \u5207\u6362\u914D\u7F6E\u3002',
+    rootHpath: "\u76EE\u6807 HPath\uFF08\u5F53\u524D\u7B14\u8BB0\u672C\u5185\u7684\u6839\u8DEF\u5F84\uFF09",
     rootHpathHint: "\u4F8B\u5982\u586B /inbox\uFF1B\u76D1\u542C\u6587\u4EF6\u5939\u91CC\u7684 foo/bar.md \u4F1A\u53D8\u6210 /inbox/foo/bar",
     writeBackIAL: "\u5C06\u601D\u6E90\u751F\u6210\u7684 IAL \u5757 ID \u5199\u56DE .md \u6E90\u6587\u4EF6",
     writeBackIALHint: "\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF09\u540E .md \u4FDD\u6301\u5E72\u51C0\uFF0C\u5757\u5F15\u7528 ((xxx)) \u4F1A\u5931\u6548",
@@ -267,6 +333,7 @@ var t = (key) => {
 var sha256 = (text) => import_crypto.default.createHash("sha256").update(text).digest("hex");
 function stripIal(text) {
   let out = text.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "");
+  out = out.replace(/\{:[^}]*\}/g, "");
   out = out.replace(/\n{3,}/g, "\n\n");
   out = out.replace(/\s+$/, "");
   return out;
@@ -294,10 +361,11 @@ var Sync = class {
     this.log = opts.log || console.log;
     this._pullTimers = {};
   }
-  /** 给定一个 .md 的绝对路径，判断它归属哪个监听文件夹。 */
+  /** 给定一个 .md 的绝对路径，判断它归属哪个笔记本的哪个监听文件夹。 */
   findWatchedFolder(absPath) {
-    for (const f of this.state.folders) {
-      if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) return f;
+    for (const item of this.state.allWatched()) {
+      const f = item.folder;
+      if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) return item;
     }
     return null;
   }
@@ -309,10 +377,12 @@ var Sync = class {
    * @returns {string|null} 新建/更新后的 doc id，失败为 null
    */
   async importFile(absPath, { force = false } = {}) {
-    if (!this.state.notebookId) {
-      this.log("\u672A\u914D\u7F6E\u76EE\u6807\u7B14\u8BB0\u672C\uFF0C\u8DF3\u8FC7");
+    const watched = this.findWatchedFolder(absPath);
+    if (!watched) {
+      this.log("[import] \u8DEF\u5F84\u4E0D\u5728\u4EFB\u4F55\u76D1\u542C\u76EE\u5F55\u5185:", absPath);
       return null;
     }
+    const { notebookId, folder, rootHpath } = watched;
     let content;
     try {
       content = await import_promises.default.readFile(absPath, "utf-8");
@@ -326,21 +396,16 @@ var Sync = class {
       this.log("[import] hash \u5339\u914D\uFF0C\u8DF3\u8FC7:", absPath);
       return existing.docId;
     }
-    const folder = this.findWatchedFolder(absPath);
-    if (!folder) {
-      this.log("[import] \u8DEF\u5F84\u4E0D\u5728\u4EFB\u4F55\u76D1\u542C\u76EE\u5F55\u5185:", absPath);
-      return null;
-    }
     const rel = relToRoot(absPath, [folder]);
-    const hpath = toHPath(this.state.rootHpath, rel);
+    const hpath = toHPath(rootHpath, rel);
     try {
       if (existing?.docId) {
         const storage = await this.api.getDocStoragePath(existing.docId);
         if (storage) {
-          await this.api.removeDoc(this.state.notebookId, storage);
+          await this.api.removeDoc(notebookId, storage);
         }
       }
-      const newId = await this.api.createDocWithMd(this.state.notebookId, hpath, content);
+      const newId = await this.api.createDocWithMd(notebookId, hpath, content);
       if (!newId) throw new Error("createDocWithMd \u672A\u8FD4\u56DE id");
       const syContent = await this.api.getDocKramdown(newId);
       const syHash = sha256(syContent);
@@ -352,11 +417,12 @@ var Sync = class {
       this.state.set(absPath, {
         docId: newId,
         hpath,
+        notebookId,
         mdHash: fileOnDiskHash,
         syHash
       });
       this.state.save();
-      this.log("[import] OK", absPath, "\u2192", hpath);
+      this.log("[import] OK", absPath, "\u2192", hpath, "(in", notebookId.slice(0, 8) + "...)");
       return newId;
     } catch (e) {
       this.log("[import] \u5931\u8D25", absPath, e.message);
@@ -368,10 +434,15 @@ var Sync = class {
   async deleteFile(absPath) {
     const existing = this.state.get(absPath);
     if (!existing?.docId) return;
+    const notebookId = existing.notebookId || this.state.activeNotebookId;
+    if (!notebookId) {
+      this.log("[delete] \u627E\u4E0D\u5230\u5F52\u5C5E\u7B14\u8BB0\u672C\uFF0C\u8DF3\u8FC7:", absPath);
+      return;
+    }
     try {
       const storage = await this.api.getDocStoragePath(existing.docId);
       if (storage) {
-        await this.api.removeDoc(this.state.notebookId, storage);
+        await this.api.removeDoc(notebookId, storage);
         this.log("[delete] OK", absPath);
       }
     } catch (e) {
@@ -544,9 +615,14 @@ var Sync = class {
   async reconcile() {
     this.log("[reconcile] start");
     let changed = 0;
-    for (const folder of this.state.folders) {
+    const watched = this.state.allWatched();
+    if (watched.length === 0) {
+      this.notify("\u6CA1\u6709\u914D\u7F6E\u4EFB\u4F55\u76D1\u542C\u6587\u4EF6\u5939");
+      return 0;
+    }
+    for (const item of watched) {
       try {
-        const files = await this.walkMd(folder.path);
+        const files = await this.walkMd(item.folder.path);
         for (const f of files) {
           const content = await import_promises.default.readFile(f, "utf-8").catch(() => null);
           if (content == null) continue;
@@ -558,7 +634,7 @@ var Sync = class {
           }
         }
       } catch (e) {
-        this.log("[reconcile] folder error", folder.path, e.message);
+        this.log("[reconcile] folder error", item.folder.path, e.message);
       }
     }
     this.notify(`${t("reconcileDone")}: ${changed}`);
@@ -579,11 +655,13 @@ var Watcher = class {
     this._timers = {};
   }
   start() {
-    if (!this.state.folders?.length) return;
-    for (const folder of this.state.folders) {
-      this._watchOne(folder.path);
+    const watched = this.state.allWatched();
+    if (!watched.length) return;
+    for (const item of watched) {
+      this._watchOne(item.folder.path);
     }
-    this.notify(`${t("watching")}: ${this.state.folders.length} \u4E2A`);
+    const nbCount = new Set(watched.map((w) => w.notebookId)).size;
+    this.notify(`${t("watching")}: ${watched.length} \u4E2A\u6587\u4EF6\u5939\uFF0C${nbCount} \u4E2A\u7B14\u8BB0\u672C`);
     this.sync.reconcile().catch((e) => this.log("[watcher] reconcile err", e));
   }
   stop() {
@@ -677,9 +755,16 @@ function registerCommands(plugin) {
     callback: async () => {
       const filePath = await pickFile();
       if (!filePath) return;
-      if (!state.folders.some((f) => filePath.startsWith(f.path + "/") || filePath === f.path)) {
-        state.folders.push({ path: import_path3.default.dirname(filePath), label: "\u4E34\u65F6" });
-        state.save();
+      if (!state.activeNotebookId) {
+        (0, import_siyuan4.showMessage)("\u8BF7\u5148\u5728\u63D2\u4EF6\u8BBE\u7F6E\u91CC\u9009\u62E9\u4E00\u4E2A\u7B14\u8BB0\u672C", 3e3, "error");
+        return;
+      }
+      const watched = state.allWatched();
+      if (!watched.some((w) => filePath.startsWith(w.folder.path + "/") || filePath === w.folder.path)) {
+        const cur = state.ensureActive();
+        cur.folders.push({ path: import_path3.default.dirname(filePath), label: "\u4E34\u65F6" });
+        await state.save();
+        await plugin.stopWatcher();
         plugin.startWatcher();
       }
       const id = await sync.importFile(filePath);
@@ -694,9 +779,15 @@ function registerCommands(plugin) {
     callback: async () => {
       const folderPath = await pickDirectory();
       if (!folderPath) return;
-      if (!state.folders.some((f) => f.path === folderPath)) {
-        state.folders.push({ path: folderPath, label: folderPath });
-        state.save();
+      if (!state.activeNotebookId) {
+        (0, import_siyuan4.showMessage)("\u8BF7\u5148\u5728\u63D2\u4EF6\u8BBE\u7F6E\u91CC\u9009\u62E9\u4E00\u4E2A\u7B14\u8BB0\u672C", 3e3, "error");
+        return;
+      }
+      const cur = state.ensureActive();
+      if (!cur.folders.some((f) => f.path === folderPath)) {
+        cur.folders.push({ path: folderPath, label: folderPath });
+        await state.save();
+        await plugin.stopWatcher();
         plugin.startWatcher();
       }
       const n = await sync.importFolder(folderPath);
@@ -755,7 +846,7 @@ function registerCommands(plugin) {
       const fs3 = require("fs/promises");
       const crypto2 = require("crypto");
       const sha = (t2) => crypto2.createHash("sha256").update(t2).digest("hex");
-      const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
+      const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "").replace(/\{:[^}]*\}/g, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
       let n = 0;
       for (const [absPath, info] of Object.entries(state.mappings || {})) {
         try {
@@ -834,10 +925,10 @@ var index_default = class extends import_siyuan5.Plugin {
         this.sync.onWebSocketMessage(e?.detail);
       });
       registerCommands(this);
-      if (this.state.folders?.length && this.state.importOnChange) {
+      if (this.state.allWatched().length && this.state.importOnChange) {
         this.startWatcher();
       }
-      if (!this.state.notebookId) {
+      if (!this.state.activeNotebookId) {
         (0, import_siyuan5.showMessage)(t("firstRunHint"), 5e3, "info");
       } else {
         this.notify(t("pluginLoaded"));
@@ -899,84 +990,36 @@ var index_default = class extends import_siyuan5.Plugin {
       createActionElement: () => {
         const sel = document.createElement("select");
         sel.className = "b3-select";
-        const current = this.state.notebookId;
-        if (!this.notebooks.some((nb) => nb.id === current)) {
-          if (current) {
-            const opt = document.createElement("option");
-            opt.value = current;
-            opt.textContent = `(\u4E0D\u53EF\u7528) ${current.slice(0, 8)}\u2026`;
-            opt.selected = true;
-            sel.appendChild(opt);
+        this._renderNotebookSelect(sel);
+        sel.addEventListener("change", async () => {
+          this.state.setActive(sel.value);
+          await this.state.save();
+          this._renderFolderList();
+          this._renderRootHpathInput();
+          await this.stopWatcher();
+          if (this.state.allWatched().length && this.state.importOnChange) {
+            this.startWatcher();
           }
-        }
-        this.notebooks.forEach((nb) => {
-          const opt = document.createElement("option");
-          opt.value = nb.id;
-          opt.textContent = nb.closed ? `${nb.name}\uFF08\u5DF2\u5173\u95ED\uFF09` : nb.name;
-          if (nb.id === current) opt.selected = true;
-          sel.appendChild(opt);
-        });
-        sel.addEventListener("change", () => {
-          this.state.notebookId = sel.value;
         });
         return sel;
       }
     });
-    const hpathInput = document.createElement("input");
-    hpathInput.className = "b3-text-field fn__size200";
-    hpathInput.value = this.state.rootHpath;
-    hpathInput.addEventListener("change", () => {
-      this.state.rootHpath = hpathInput.value || "/inbox";
-    });
+    this._hpathInput = document.createElement("input");
+    this._hpathInput.className = "b3-text-field fn__size200";
+    this._renderRootHpathInput();
     setting.addItem({
       title: t("rootHpath"),
       direction: "row",
       description: t("rootHpathHint"),
-      actionElement: hpathInput
+      actionElement: this._hpathInput
     });
-    const folderContainer = document.createElement("div");
-    const renderFolders = () => {
-      folderContainer.innerHTML = "";
-      const list = document.createElement("div");
-      list.style.cssText = "display:flex;flex-direction:column;gap:4px;";
-      this.state.folders.forEach((f, i) => {
-        const row = document.createElement("div");
-        row.style.cssText = "display:flex;gap:4px;align-items:center;";
-        const span = document.createElement("span");
-        span.textContent = f.path;
-        span.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
-        const btn = document.createElement("button");
-        btn.textContent = "\u2715";
-        btn.className = "b3-button b3-button--outline fn__size100";
-        btn.addEventListener("click", async () => {
-          this.state.folders.splice(i, 1);
-          await this.state.save();
-          renderFolders();
-        });
-        row.appendChild(span);
-        row.appendChild(btn);
-        list.appendChild(row);
-      });
-      const addBtn = document.createElement("button");
-      addBtn.textContent = "+ " + t("addFolder");
-      addBtn.className = "b3-button b3-button--outline fn__size200";
-      addBtn.addEventListener("click", async () => {
-        const p = await inputDialog2(t("addFolderTitle"), t("addFolderPrompt"), "/Users/me/notes");
-        if (p) {
-          this.state.folders.push({ path: p, label: p });
-          await this.state.save();
-          renderFolders();
-        }
-      });
-      list.appendChild(addBtn);
-      folderContainer.appendChild(list);
-    };
-    renderFolders();
+    this._folderContainer = document.createElement("div");
+    this._renderFolderList();
     setting.addItem({
       title: t("watchedFolders"),
       direction: "row",
       description: t("noFolders"),
-      actionElement: folderContainer
+      actionElement: this._folderContainer
     });
     const ialCheckbox = document.createElement("input");
     ialCheckbox.type = "checkbox";
@@ -1005,6 +1048,83 @@ var index_default = class extends import_siyuan5.Plugin {
       actionElement: bidiCheckbox
     });
     this.setting = setting;
+  }
+  _renderNotebookSelect(sel) {
+    sel.innerHTML = "";
+    const current = this.state.activeNotebookId;
+    if (!this.notebooks.some((nb) => nb.id === current)) {
+      if (current) {
+        const opt = document.createElement("option");
+        opt.value = current;
+        opt.textContent = `(\u4E0D\u53EF\u7528) ${current.slice(0, 8)}\u2026`;
+        opt.selected = true;
+        sel.appendChild(opt);
+      }
+    }
+    for (const nb of this.notebooks) {
+      const opt = document.createElement("option");
+      opt.value = nb.id;
+      opt.textContent = nb.closed ? `${nb.name}\uFF08\u5DF2\u5173\u95ED\uFF09` : nb.name;
+      if (nb.id === current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
+  _renderRootHpathInput() {
+    const cfg = this.state.getActive();
+    this._hpathInput.value = cfg?.rootHpath || "/inbox";
+    this._hpathInput.onchange = () => {
+      const cur = this.state.ensureActive();
+      if (cur) cur.rootHpath = this._hpathInput.value || "/inbox";
+    };
+  }
+  _renderFolderList() {
+    if (!this._folderContainer) return;
+    this._folderContainer.innerHTML = "";
+    const cfg = this.state.getActive();
+    const folders = cfg?.folders || [];
+    const list = document.createElement("div");
+    list.style.cssText = "display:flex;flex-direction:column;gap:4px;";
+    folders.forEach((f, i) => {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:4px;align-items:center;";
+      const span = document.createElement("span");
+      span.textContent = f.path;
+      span.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      const btn = document.createElement("button");
+      btn.textContent = "\u2715";
+      btn.className = "b3-button b3-button--outline fn__size100";
+      btn.addEventListener("click", async () => {
+        const cur = this.state.ensureActive();
+        cur.folders.splice(i, 1);
+        await this.state.save();
+        this._renderFolderList();
+        await this.stopWatcher();
+        if (this.state.allWatched().length && this.state.importOnChange) {
+          this.startWatcher();
+        }
+      });
+      row.appendChild(span);
+      row.appendChild(btn);
+      list.appendChild(row);
+    });
+    const addBtn = document.createElement("button");
+    addBtn.textContent = "+ " + t("addFolder");
+    addBtn.className = "b3-button b3-button--outline fn__size200";
+    addBtn.addEventListener("click", async () => {
+      const p = await inputDialog2(t("addFolderTitle"), t("addFolderPrompt"), "/Users/me/notes");
+      if (p) {
+        const cur = this.state.ensureActive();
+        cur.folders.push({ path: p, label: p });
+        await this.state.save();
+        this._renderFolderList();
+        if (this.state.importOnChange) {
+          await this.stopWatcher();
+          this.startWatcher();
+        }
+      }
+    });
+    list.appendChild(addBtn);
+    this._folderContainer.appendChild(list);
   }
   startWatcher() {
     if (!this.watcher) return;
