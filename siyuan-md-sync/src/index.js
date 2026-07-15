@@ -51,6 +51,7 @@ export default class extends Plugin {
 
       this.notebooks = [];
       await this.refreshNotebooks();
+      await this.validateNotebooks();
 
       this.sync = new Sync(this.api, this.state, {
         notify: this.notify,
@@ -129,6 +130,35 @@ export default class extends Plugin {
     } catch (e) {
       this.log('refreshNotebooks failed', e);
     }
+  }
+
+  /**
+   * 清理 state 中已失效的 notebook 配置：
+   * - 比对当前 this.notebooks，找出 state.notebooks 里已不存在（或 closed）的 nbId
+   * - 对每个失效的 nbId 调用 state.removeNotebook，清理所有 instance
+   * - 持久化 + 通知用户
+   */
+  async validateNotebooks() {
+    if (!this.state || !this.notebooks || !this.notebooks.length) return;
+    const liveIds = new Set(this.notebooks.map(n => n.id));
+    const stale = [];
+    for (const nbId of Object.keys(this.state.notebooks || {})) {
+      if (!liveIds.has(nbId)) stale.push(nbId);
+    }
+    if (!stale.length) return;
+    let totalInstances = 0;
+    const dbg = (m) => { this.log(m); try { require('fs').appendFileSync('/tmp/siyuan-ws-debug.log', `[validate] ${m}\n`); } catch {} };
+    for (const nbId of stale) {
+      const removed = this.state.removeNotebook(nbId);
+      totalInstances += removed;
+      dbg(`validateNotebooks: removed stale config ${nbId} (${removed} instance(s) cleaned)`);
+    }
+    await this.state.save();
+    const msg = stale.length === 1
+      ? `清理了 1 个失效的笔记本配置（${totalInstances} 个 instance）`
+      : `清理了 ${stale.length} 个失效的笔记本配置（${totalInstances} 个 instance）`;
+    dbg(msg);
+    this.notify(msg, 'info');
   }
 
   async onunload() {

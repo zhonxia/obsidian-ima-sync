@@ -26,7 +26,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// src/index.js
+// siyuan-md-sync/src/index.js
 var index_exports = {};
 __export(index_exports, {
   default: () => index_default
@@ -34,8 +34,10 @@ __export(index_exports, {
 module.exports = __toCommonJS(index_exports);
 var import_siyuan5 = require("siyuan");
 
-// src/api.js
+// siyuan-md-sync/src/api.js
 var import_siyuan = require("siyuan");
+var import_path = __toESM(require("path"));
+var import_promises = __toESM(require("fs/promises"));
 var SiyuanError = class extends Error {
   constructor(msg, resp) {
     super(msg);
@@ -50,6 +52,54 @@ function check(resp) {
   return resp.data;
 }
 var Api = class {
+  constructor(opts = {}) {
+    this.dataDir = opts.dataDir || "";
+    this._dataDirPromise = null;
+  }
+  /**
+   * 初始化 dataDir。必须先调用一次，再使用 readTitleFromSy 等需要绝对路径的方法。
+   * 在 plugin.onload 中尽早调用。
+   */
+  async initDataDir() {
+    if (this.dataDir) return this.dataDir;
+    if (this._dataDirPromise) return this._dataDirPromise;
+    this._dataDirPromise = (async () => {
+      let workspaceDir = "";
+      try {
+        const info = await this._post("/api/system/getWorkspaceInfo");
+        workspaceDir = info?.workspaceDir || "";
+      } catch {
+      }
+      if (!workspaceDir) {
+        try {
+          const list = await this._post("/api/system/getWorkspaces");
+          const ws = Array.isArray(list) ? list.find((x) => !x.closed) || list[0] : null;
+          workspaceDir = ws?.path || "";
+        } catch {
+        }
+      }
+      if (!workspaceDir) {
+        workspaceDir = process.env.SIYUAN_DATA_DIR || "";
+      }
+      if (!workspaceDir) {
+        this.dataDir = "";
+        return "";
+      }
+      const dataDir = import_path.default.join(workspaceDir, "data");
+      try {
+        await import_promises.default.access(dataDir);
+        this.dataDir = dataDir;
+      } catch {
+        this.dataDir = workspaceDir;
+      }
+      return this.dataDir;
+    })();
+    return this._dataDirPromise;
+  }
+  /** 同步获取 dataDir（如果已 init）。 */
+  getDataDir() {
+    return this.dataDir;
+  }
   async _post(endpoint, data = {}) {
     const resp = await (0, import_siyuan.fetchSyncPost)(endpoint, data);
     return check(resp);
@@ -90,9 +140,52 @@ var Api = class {
   async removeDoc(notebookId, storagePath) {
     return this._post("/api/filetree/removeDoc", { notebook: notebookId, path: storagePath });
   }
+  /** 读取块信息（含 box、path、rootTitle 等）。 */
+  async getBlockInfo(id) {
+    return this._post("/api/block/getBlockInfo", { id });
+  }
+  /** 从 .sy 文件读取标题。storagePath 形如 /parent/thisDoc.sy */
+  async readTitleFromSy(notebookId, storagePath) {
+    if (!this.dataDir) {
+      try {
+        require("fs").appendFileSync(
+          "/tmp/siyuan-ws-debug.log",
+          `[readTitle] dataDir not initialized!
+`
+        );
+      } catch {
+      }
+      await this.initDataDir();
+    }
+    const fp = import_path.default.join(this.dataDir, notebookId, storagePath);
+    try {
+      const buf = await import_promises.default.readFile(fp, "utf-8");
+      const j = JSON.parse(buf);
+      const t2 = j?.Properties?.title || "";
+      try {
+        require("fs").appendFileSync(
+          "/tmp/siyuan-ws-debug.log",
+          `[readTitle] ${fp} => ${JSON.stringify(t2)}
+`
+        );
+      } catch {
+      }
+      return t2;
+    } catch (e) {
+      try {
+        require("fs").appendFileSync(
+          "/tmp/siyuan-ws-debug.log",
+          `[readTitle err] ${fp}: ${e.message}
+`
+        );
+      } catch {
+      }
+      return "";
+    }
+  }
 };
 
-// src/state.js
+// siyuan-md-sync/src/state.js
 var STORAGE_KEY = "state";
 var SCHEMA_VERSION = 3;
 var State = class {
@@ -266,9 +359,9 @@ var State = class {
   }
   /** 按 docId 找到 instance 和 path。 */
   byDocId(docId) {
-    for (const [path4, m] of Object.entries(this.mappings)) {
+    for (const [path5, m] of Object.entries(this.mappings)) {
       for (const inst of m.instances || []) {
-        if (inst.docId === docId) return { path: path4, mdHash: m.mdHash, instance: inst };
+        if (inst.docId === docId) return { path: path5, mdHash: m.mdHash, instance: inst };
       }
     }
     return null;
@@ -276,6 +369,49 @@ var State = class {
   /** 删除整个 mapping entry。 */
   remove(absPath) {
     delete this.mappings[absPath];
+  }
+  /**
+   * 移除整个 notebook 配置及其所有 instance。
+   * - 删除 this.notebooks[nbId]
+   * - 清理 mappings 中所有引用该 nbId 的 instance（path 仍保留，孤儿 .md 留给用户处理）
+   * - 若 activeNotebookId 命中，重置为空
+   * @returns {number} 被清理的 mapping 数
+   */
+  removeNotebook(nbId) {
+    if (!nbId) return 0;
+    let removed = 0;
+    for (const [path5, m] of Object.entries(this.mappings)) {
+      const before = (m.instances || []).length;
+      m.instances = (m.instances || []).filter((i) => i.notebookId !== nbId);
+      if (m.instances.length === 0) {
+        delete this.mappings[path5];
+      }
+      removed += before - m.instances.length;
+    }
+    delete this.notebooks[nbId];
+    if (this.activeNotebookId === nbId) this.activeNotebookId = "";
+    return removed;
+  }
+  /** 重命名：把映射的 key 从 oldPath 改成 newPath（保留 mdHash 和 instances）。 */
+  renamePath(oldPath, newPath) {
+    if (oldPath === newPath) return;
+    const m = this.mappings[oldPath];
+    if (!m) return;
+    if (this.mappings[newPath]) {
+      const existing = this.mappings[newPath];
+      const seen = new Set(existing.instances.map((i) => `${i.notebookId}::${i.docId}`));
+      for (const inst of m.instances || []) {
+        const k = `${inst.notebookId}::${inst.docId}`;
+        if (!seen.has(k)) {
+          existing.instances.push(inst);
+          seen.add(k);
+        }
+      }
+      delete this.mappings[oldPath];
+    } else {
+      delete this.mappings[oldPath];
+      this.mappings[newPath] = m;
+    }
   }
   /** 按 notebookId 移除该 path 的 instance（用于从笔记本上删除文件夹时）。 */
   removeByNotebook(absPath, notebookId) {
@@ -292,13 +428,14 @@ var State = class {
   }
 };
 
-// src/sync.js
+// siyuan-md-sync/src/sync.js
 var import_crypto = __toESM(require("crypto"));
-var import_path = __toESM(require("path"));
-var import_promises = __toESM(require("fs/promises"));
+var import_path2 = __toESM(require("path"));
+var import_promises2 = __toESM(require("fs/promises"));
+var import_fs = __toESM(require("fs"));
 var import_siyuan2 = require("siyuan");
 
-// src/i18n.js
+// siyuan-md-sync/src/i18n.js
 var lang = typeof window !== "undefined" && window.siyuan?.config?.lang || "zh_CN";
 var messages = {
   zh_CN: {
@@ -405,7 +542,7 @@ var t = (key) => {
   return dict[key] || messages.en_US[key] || key;
 };
 
-// src/sync.js
+// siyuan-md-sync/src/sync.js
 var sha256 = (text) => import_crypto.default.createHash("sha256").update(text).digest("hex");
 function stripIal(text) {
   let out = text.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "");
@@ -416,7 +553,7 @@ function stripIal(text) {
 }
 function relToRoot(absPath, folders) {
   for (const f of folders) {
-    if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) {
+    if (absPath.startsWith(f.path + import_path2.default.sep) || absPath === f.path) {
       let rel = absPath.slice(f.path.length).replace(/\\/g, "/");
       if (rel.startsWith("/")) rel = rel.slice(1);
       return rel;
@@ -436,13 +573,14 @@ var Sync = class {
     this.notify = opts.notify || ((msg, type) => (0, import_siyuan2.showMessage)(msg, 3e3, type || "info"));
     this.log = opts.log || console.log;
     this._pullTimers = {};
+    this._newDocTimers = {};
   }
   /** 给定一个 .md 的绝对路径，返回所有应拥有它的 (notebookId, folder, rootHpath)。 */
   findWatchers(absPath) {
     const out = [];
     for (const item of this.state.allWatched()) {
       const f = item.folder;
-      if (absPath.startsWith(f.path + import_path.default.sep) || absPath === f.path) {
+      if (absPath.startsWith(f.path + import_path2.default.sep) || absPath === f.path) {
         out.push(item);
       }
     }
@@ -465,7 +603,7 @@ var Sync = class {
     }
     let content;
     try {
-      content = await import_promises.default.readFile(absPath, "utf-8");
+      content = await import_promises2.default.readFile(absPath, "utf-8");
     } catch (e) {
       this.log("readFile \u5931\u8D25", absPath, e.message);
       return null;
@@ -509,7 +647,7 @@ var Sync = class {
       const syContent = await this.api.getDocKramdown(newId);
       const syHash = sha256(stripIal(syContent));
       if (this.state.writeBackIAL && syContent !== content) {
-        await import_promises.default.writeFile(absPath, syContent, "utf-8");
+        await import_promises2.default.writeFile(absPath, syContent, "utf-8");
       }
       this.state.upsertInstance(absPath, {
         docId: newId,
@@ -551,13 +689,13 @@ var Sync = class {
     const walk = async (dir) => {
       let entries;
       try {
-        entries = await import_promises.default.readdir(dir, { withFileTypes: true });
+        entries = await import_promises2.default.readdir(dir, { withFileTypes: true });
       } catch (e) {
         return;
       }
       for (const e of entries) {
         if (e.name.startsWith(".")) continue;
-        const p = import_path.default.join(dir, e.name);
+        const p = import_path2.default.join(dir, e.name);
         if (e.isDirectory()) await walk(p);
         else if (e.isFile() && e.name.toLowerCase().endsWith(".md")) out.push(p);
       }
@@ -584,19 +722,19 @@ var Sync = class {
       const kramdown = await this.api.getDocKramdown(docId);
       let existing = "";
       try {
-        existing = await import_promises.default.readFile(targetAbsPath, "utf-8");
+        existing = await import_promises2.default.readFile(targetAbsPath, "utf-8");
       } catch {
       }
       const existingRecord = this.state.get(targetAbsPath);
       if (existing && existingRecord && sha256(existing) !== existingRecord.mdHash) {
         const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-        const dir = import_path.default.dirname(targetAbsPath);
-        const base = import_path.default.basename(targetAbsPath, ".md");
-        const backup = import_path.default.join(dir, `${base}.conflict-${ts}.md`);
-        await import_promises.default.writeFile(backup, existing, "utf-8");
-        this.notify(`\u5DF2\u5907\u4EFD\u51B2\u7A81: ${import_path.default.basename(backup)}`, "info");
+        const dir = import_path2.default.dirname(targetAbsPath);
+        const base = import_path2.default.basename(targetAbsPath, ".md");
+        const backup = import_path2.default.join(dir, `${base}.conflict-${ts}.md`);
+        await import_promises2.default.writeFile(backup, existing, "utf-8");
+        this.notify(`\u5DF2\u5907\u4EFD\u51B2\u7A81: ${import_path2.default.basename(backup)}`, "info");
       }
-      await import_promises.default.writeFile(targetAbsPath, kramdown, "utf-8");
+      await import_promises2.default.writeFile(targetAbsPath, kramdown, "utf-8");
       const h = sha256(kramdown);
       this.state.upsertInstance(targetAbsPath, {
         docId,
@@ -618,19 +756,430 @@ var Sync = class {
   onWebSocketMessage(msg) {
     if (this.state.bidirectional === false) return;
     if (!msg || !msg.data) return;
+    const data = msg.data;
+    if (!this._wsDbg) {
+      this._wsDbg = import_fs.default.createWriteStream("/tmp/siyuan-ws-debug.log", { flags: "a" });
+    }
+    const stamp = (/* @__PURE__ */ new Date()).toISOString().slice(11, 23);
+    const short = JSON.stringify(data).slice(0, 400);
+    this._wsDbg.write(`[${stamp}] ${short}
+`);
+    if (data && typeof data === "object" && data.path) {
+      if (typeof data.box === "object" && data.box !== null) {
+        this.scheduleNewDocCheck(data.box.id, data.path);
+      } else if (typeof data.box === "string" && data.id && data.title) {
+        const oldTitle = this._oldTitleFor(data.id);
+        if (oldTitle && oldTitle !== data.title) {
+          this.scheduleRename(data.id, oldTitle, data.title);
+        }
+      }
+    }
+    if (data && Array.isArray(data.ids) && data.ids.length) {
+      this.scheduleDeleted(data.ids);
+    }
+    if (Array.isArray(data) && data.length) {
+      for (const tx of data) {
+        if (!tx || !Array.isArray(tx.doOperations)) continue;
+        for (const op of tx.doOperations) {
+          if (op?.action === "updateAttrs" && op.data?.new && op.data?.old) {
+            const oldTitle = op.data.old.title;
+            const newTitle = op.data.new.title;
+            const id = op.data.new.id || op.data.old.id;
+            if (id && newTitle && oldTitle && newTitle !== oldTitle) {
+              this.scheduleRename(id, oldTitle, newTitle);
+            }
+          }
+        }
+      }
+    }
     const trackedIds = /* @__PURE__ */ new Set();
     for (const m of Object.values(this.state.mappings || {})) {
       for (const inst of m.instances || []) {
         if (inst?.docId) trackedIds.add(inst.docId);
       }
     }
-    if (trackedIds.size === 0) return;
-    const dataStr = this._safeStringify(msg.data);
+    const dataStr = this._safeStringify(data);
     for (const docId of trackedIds) {
       if (dataStr.includes(docId)) {
         this.schedulePull(docId);
       }
     }
+  }
+  // =============== 删除/重命名事件处理 ===============
+  /**
+   * 防抖删除：多个 docId 一次性处理。500ms 内同一批 ids 只跑一次。
+   * 对每个被删的 docId：
+   *   1. 找到该 docId 在 mappings 里的所有 .md 路径（一个 docId 可能在多份 .md 中存在）
+   *   2. 删除对应的 .md 文件（如果是文件夹/容器，则删除整棵子目录）
+   *   3. 从 mappings 中清理所有引用
+   */
+  scheduleDeleted(ids) {
+    if (!Array.isArray(ids) || !ids.length) return;
+    const key = "d:" + ids.slice().sort().join(",");
+    if (this._delTimers && this._delTimers[key]) clearTimeout(this._delTimers[key]);
+    this._delTimers = this._delTimers || {};
+    this._delTimers[key] = setTimeout(() => {
+      delete this._delTimers[key];
+      this.handleDeleted(ids).catch((e) => {
+        this.log("[del] err", e.message);
+        if (this._wsDbg) this._wsDbg.write(`[ERR del] ${e.message}
+${e.stack}
+`);
+      });
+    }, 500);
+  }
+  async handleDeleted(docIds) {
+    const idSet = new Set(docIds);
+    const dbg = (m) => {
+      this.log("[del]", m);
+      if (this._wsDbg) this._wsDbg.write(`[del] ${m}
+`);
+    };
+    dbg(`handle ${docIds.length} ids: ${docIds.join(", ")}`);
+    if (this._newDocInflight) {
+      for (const id of docIds) {
+        const inflight = this._newDocInflight[id];
+        if (inflight) {
+          dbg(`waiting up to 1.5s for in-flight newDoc for ${id}`);
+          await Promise.race([
+            inflight,
+            new Promise((r) => setTimeout(r, 1500))
+          ]);
+        }
+      }
+    }
+    const affected = /* @__PURE__ */ new Set();
+    for (const [abs, m] of Object.entries(this.state.mappings || {})) {
+      for (const inst of m.instances || []) {
+        if (idSet.has(inst.docId)) {
+          affected.add(abs);
+          break;
+        }
+      }
+    }
+    if (!affected.size) {
+      dbg("no affected mapping found, ignoring");
+      return;
+    }
+    dbg(`affected .md paths: ${[...affected].length}`);
+    for (const abs of affected) {
+      const m = this.state.get(abs);
+      const remaining = (m?.instances || []).filter((inst) => !idSet.has(inst.docId));
+      if (remaining.length > 0) {
+        dbg(`skip fs rm of ${abs}, ${remaining.length} instance(s) still alive (1-to-many)`);
+        continue;
+      }
+      try {
+        const stat = await import_promises2.default.stat(abs).catch(() => null);
+        if (stat?.isDirectory()) {
+          await import_promises2.default.rm(abs, { recursive: true, force: true });
+          dbg(`removed dir ${abs}`);
+        } else if (stat?.isFile()) {
+          await import_promises2.default.unlink(abs);
+          dbg(`removed file ${abs}`);
+        }
+      } catch (e) {
+        dbg(`fs rm err for ${abs}: ${e.message}`);
+      }
+      this.state.remove(abs);
+    }
+    for (const [abs, m] of Object.entries(this.state.mappings || {})) {
+      const keep = (m.instances || []).filter((inst) => !idSet.has(inst.docId));
+      if (keep.length !== (m.instances || []).length) {
+        if (keep.length === 0) {
+          this.state.remove(abs);
+        } else {
+          m.instances = keep;
+        }
+      }
+    }
+    await this.state.save();
+    this.notify(`\u5DF2\u5220\u9664 ${affected.size} \u4E2A .md\uFF08\u601D\u6E90 ${docIds.length} \u4E2A doc\uFF09`, "info");
+  }
+  /**
+   * 重命名/标题变化：把 .md 文件名改成新标题。
+   * 如果被改名的是父 doc（容器），把整棵子目录改名。
+   */
+  scheduleRename(docId, oldTitle, newTitle) {
+    if (!docId || !newTitle || newTitle === oldTitle) return;
+    const key = "r:" + docId;
+    if (this._renameTimers && this._renameTimers[key]) clearTimeout(this._renameTimers[key]);
+    this._renameTimers = this._renameTimers || {};
+    this._renameTimers[key] = setTimeout(() => {
+      delete this._renameTimers[key];
+      this.handleRename(docId, newTitle).catch((e) => {
+        this.log("[rename] err", e.message);
+        if (this._wsDbg) this._wsDbg.write(`[ERR rename] ${e.message}
+${e.stack}
+`);
+      });
+    }, 600);
+  }
+  async handleRename(docId, newTitle) {
+    const dbg = (m) => {
+      this.log("[rename]", m);
+      if (this._wsDbg) this._wsDbg.write(`[rename] ${m}
+`);
+    };
+    dbg(`handle ${docId} \u2192 "${newTitle}"`);
+    const hits = [];
+    for (const [abs, m] of Object.entries(this.state.mappings || {})) {
+      for (const inst of m.instances || []) {
+        if (inst.docId === docId) {
+          hits.push({ abs, inst });
+          break;
+        }
+      }
+    }
+    if (!hits.length) {
+      dbg("not in any mapping, ignoring");
+      return;
+    }
+    for (const { abs, inst } of hits) {
+      const stat = await import_promises2.default.stat(abs).catch(() => null);
+      if (!stat) continue;
+      const parent = import_path2.default.dirname(abs);
+      const newName = newTitle;
+      try {
+        if (stat.isFile()) {
+          if (import_path2.default.basename(abs) === newName + ".md") {
+            dbg(`file already named ${newName}.md, skip`);
+          } else {
+            const newPath = import_path2.default.join(parent, newName + ".md");
+            const target = await this._findFreePath(newPath);
+            await import_promises2.default.rename(abs, target);
+            this.state.renamePath(abs, target);
+            inst.hpath = this._replaceLastPathSegment(inst.hpath, newName);
+            dbg(`renamed file ${abs} \u2192 ${target}`);
+            this.notify(`\u91CD\u547D\u540D: ${import_path2.default.basename(abs)} \u2192 ${import_path2.default.basename(target)}`, "info");
+          }
+        } else if (stat.isDirectory()) {
+          if (import_path2.default.basename(abs) === newName) {
+            dbg(`dir already named ${newName}, skip`);
+          } else {
+            const newDir = import_path2.default.join(parent, newName);
+            const target = await this._findFreePath(newDir);
+            await import_promises2.default.rename(abs, target);
+            await this._renameAllInDir(abs, target, docId);
+            dbg(`renamed dir ${abs} \u2192 ${target}`);
+            this.notify(`\u91CD\u547D\u540D\u76EE\u5F55: ${import_path2.default.basename(abs)} \u2192 ${import_path2.default.basename(target)}`, "info");
+          }
+        }
+      } catch (e) {
+        dbg(`rename err for ${abs}: ${e.message}`);
+      }
+    }
+    await this.state.save();
+  }
+  /** 把 oldDir 下所有子 .md 路径映射到 newDir 下，并更新对应 instance.hpath 的最后一段 */
+  async _renameAllInDir(oldDir, newDir, renamedDocId) {
+    const walk = async (src, dst) => {
+      let entries;
+      try {
+        entries = await import_promises2.default.readdir(src, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const oldPath = import_path2.default.join(src, e.name);
+        const newPath = import_path2.default.join(dst, e.name);
+        if (e.isDirectory()) {
+          await walk(oldPath, newPath);
+        } else if (e.isFile() && e.name.toLowerCase().endsWith(".md")) {
+          this.state.renamePath(oldPath, newPath);
+          const m = this.state.get(newPath);
+          if (m) {
+            for (const inst of m.instances || []) {
+              inst.hpath = this._hpathReplaceInPath(inst.hpath, oldDir, newDir);
+            }
+          }
+        }
+      }
+    };
+    await walk(oldDir, newDir);
+  }
+  /** 把 hpath 末段（最后一级标题）改成新名 */
+  _replaceLastPathSegment(hpath, newName) {
+    if (!hpath) return hpath;
+    const parts = hpath.split("/");
+    parts[parts.length - 1] = newName;
+    return parts.join("/");
+  }
+  /** 从 state 推 docId 对应的旧标题（hpath 末段）。无 mapping 时返回 null。 */
+  _oldTitleFor(docId) {
+    for (const m of Object.values(this.state.mappings || {})) {
+      for (const inst of m.instances || []) {
+        if (inst.docId === docId && inst.hpath) {
+          const parts = inst.hpath.split("/");
+          return parts[parts.length - 1];
+        }
+      }
+    }
+    return null;
+  }
+  /** 把 hpath 中 oldDir 这一段替换成 newDir（仅做 prefix 替换） */
+  _hpathReplaceInPath(hpath, oldDir, newDir) {
+    return hpath;
+  }
+  _uniquePath(p) {
+    const ext = import_path2.default.extname(p);
+    const base = p.slice(0, p.length - ext.length);
+    let i = 1;
+    let candidate;
+    candidate = `${base}-${i}${ext}`;
+    return candidate;
+  }
+  /** 找一个不冲突的目标路径（最多试到 100）。 */
+  async _findFreePath(target) {
+    try {
+      await import_promises2.default.access(target);
+    } catch {
+      return target;
+    }
+    for (let i = 1; i < 100; i++) {
+      const c = this._uniquePath(target);
+      try {
+        await import_promises2.default.access(c);
+      } catch {
+        return c;
+      }
+    }
+    return target;
+  }
+  /**
+   * 防抖：同一个 docId 在 800ms 内多次 box 事件只处理一次。
+   * 收到 box 事件 → 调用 getBlockInfo → 派生 hpath → 落在 rootHpath 内则导出 .md。
+   * 同时给每个 docId 暴露一个 Promise，让 del/rename 处理器能等待 in-flight newDoc 完成。
+   */
+  scheduleNewDocCheck(notebookId, storagePath) {
+    const match = String(storagePath).match(/\/([\w-]+)\.sy$/);
+    if (!match) return;
+    const docId = match[1];
+    this.log("[newDoc] scheduled", docId, "in", notebookId.slice(0, 14) + "...");
+    if (this._wsDbg) this._wsDbg.write(`[newDoc] scheduled ${docId} in ${notebookId}
+`);
+    if (this._newDocTimers[docId]) clearTimeout(this._newDocTimers[docId]);
+    this._newDocInflight = this._newDocInflight || {};
+    let resolveInflight;
+    this._newDocInflight[docId] = new Promise((r) => {
+      resolveInflight = r;
+    });
+    this._newDocTimers[docId] = setTimeout(() => {
+      delete this._newDocTimers[docId];
+      this.handleNewDoc(notebookId, docId, storagePath).then(() => this.log("[newDoc] done", docId)).catch((e) => {
+        this.log("[newDoc] err", docId, e.message, e.stack);
+        if (this._wsDbg) this._wsDbg.write(`[ERR ${docId}] ${e.message}
+${e.stack}
+`);
+      }).finally(() => {
+        if (resolveInflight) resolveInflight();
+        setTimeout(() => {
+          if (this._newDocInflight) delete this._newDocInflight[docId];
+        }, 3e3);
+      });
+    }, 800);
+  }
+  async handleNewDoc(notebookId, docId, storagePath) {
+    const dbg = (m) => {
+      this.log("[newDoc]", m);
+      if (this._wsDbg) this._wsDbg.write(`[newDoc] ${m}
+`);
+    };
+    dbg(`handle ${docId} ${storagePath}`);
+    if (this.state.byDocId(docId)) {
+      dbg("already in mappings, skipping");
+      return;
+    }
+    const hpath = await this._deriveHPath(notebookId, storagePath);
+    dbg(`hpath = ${hpath}`);
+    if (!hpath || hpath === "/") return;
+    const target = this.state.allWatched().find(
+      (w) => w.notebookId === notebookId && this._hpathUnder(hpath, w.rootHpath)
+    );
+    if (!target) {
+      dbg(`hpath not under any watched rootHpath for this notebook`);
+      return;
+    }
+    dbg(`target = ${target.folder.path} rootHpath=${target.rootHpath}`);
+    const rel = this._hpathToRel(target.rootHpath, hpath);
+    if (!rel) return;
+    const targetFile = import_path2.default.join(target.folder.path, rel);
+    if (!targetFile.endsWith(".md")) return;
+    const kramdown = await this.api.getDocKramdown(docId);
+    const cleaned = stripIal(kramdown);
+    if (!cleaned.trim()) {
+      dbg("body empty, doc may have been deleted before our debounce; skipping");
+      return;
+    }
+    try {
+      const existing = await import_promises2.default.readFile(targetFile, "utf-8");
+      if (sha256(existing) !== sha256(cleaned)) {
+        const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+        const dir = import_path2.default.dirname(targetFile);
+        const base = import_path2.default.basename(targetFile, ".md");
+        await import_promises2.default.writeFile(import_path2.default.join(dir, `${base}.conflict-${ts}.md`), existing, "utf-8");
+        this.notify(`\u5DF2\u5907\u4EFD\u51B2\u7A81: ${base}.conflict-${ts}.md`);
+      }
+    } catch {
+    }
+    await import_promises2.default.mkdir(import_path2.default.dirname(targetFile), { recursive: true });
+    await import_promises2.default.writeFile(targetFile, cleaned, "utf-8");
+    const mdHash = sha256(cleaned);
+    const syHash = sha256(stripIal(kramdown));
+    this.state.upsertInstance(targetFile, {
+      docId,
+      hpath,
+      syHash,
+      notebookId
+    }, mdHash);
+    await this.state.save();
+    this.log("[newDoc] \u5BFC\u51FA", docId, "\u2192", targetFile);
+    this.notify(`\u65B0\u5EFA: ${import_path2.default.relative(target.folder.path, targetFile)}`, "info");
+  }
+  /** hpath 是否落在 rootHpath 之下（含本身）。 */
+  _hpathUnder(hpath, rootHpath) {
+    if (!rootHpath) return hpath.startsWith("/");
+    const r = rootHpath.replace(/\/+$/, "");
+    if (!r) return hpath.startsWith("/");
+    return hpath === r || hpath.startsWith(r + "/");
+  }
+  /** hpath → 相对于 rootHpath 的子路径（含 .md）。如 /inbox/foo → foo.md */
+  _hpathToRel(rootHpath, hpath) {
+    const r = (rootHpath || "").replace(/\/+$/, "");
+    let stem;
+    if (!r) {
+      if (!hpath.startsWith("/")) return null;
+      stem = hpath.slice(1);
+    } else {
+      if (hpath === r) return null;
+      if (!hpath.startsWith(r + "/")) return null;
+      stem = hpath.slice(r.length + 1);
+    }
+    if (!stem) return null;
+    return stem + ".md";
+  }
+  /**
+   * 走 storagePath 父链读 .sy 拿 title，组装 hpath。
+   * storagePath 形如 /parent/thisDoc.sy 或 /thisDoc.sy
+   */
+  async _deriveHPath(notebookId, storagePath) {
+    const parts = String(storagePath).replace(/^\//, "").replace(/\.sy$/, "").split("/");
+    if (!parts.length) return null;
+    const titles = [];
+    for (let i = 0; i < parts.length; i++) {
+      const cur = parts[i];
+      let title;
+      if (i === parts.length - 1) {
+        try {
+          const info = await this.api.getBlockInfo(cur);
+          title = info?.rootTitle;
+        } catch {
+        }
+      }
+      if (!title) title = await this.api.readTitleFromSy(notebookId, "/" + parts.slice(0, i + 1).join("/") + ".sy");
+      titles.push(title || cur);
+    }
+    return "/" + titles.join("/");
   }
   _safeStringify(obj) {
     try {
@@ -672,7 +1221,7 @@ var Sync = class {
       return;
     }
     try {
-      await import_promises.default.writeFile(absPath, cleaned, "utf-8");
+      await import_promises2.default.writeFile(absPath, cleaned, "utf-8");
     } catch (e) {
       this.log("[pull] writeFile \u5931\u8D25", absPath, e.message);
       return;
@@ -714,7 +1263,7 @@ var Sync = class {
       const files = folderCache.get(item.folder.path) || [];
       this.log("[reconcile] scanning", item.folder.path, "for notebook", item.notebookId.slice(0, 12) + "...", "\u2192", files.length, "files");
       for (const f of files) {
-        const content = await import_promises.default.readFile(f, "utf-8").catch(() => null);
+        const content = await import_promises2.default.readFile(f, "utf-8").catch(() => null);
         if (content == null) {
           summary.failed++;
           continue;
@@ -744,9 +1293,9 @@ var Sync = class {
   }
 };
 
-// src/watcher.js
-var import_fs = __toESM(require("fs"));
-var import_path2 = __toESM(require("path"));
+// siyuan-md-sync/src/watcher.js
+var import_fs2 = __toESM(require("fs"));
+var import_path3 = __toESM(require("path"));
 var Watcher = class {
   constructor(sync, state, { notify, log } = {}) {
     this.sync = sync;
@@ -779,16 +1328,16 @@ var Watcher = class {
   }
   _watchOne(dir) {
     try {
-      const w = import_fs.default.watch(dir, { recursive: true }, (event, filename) => {
+      const w = import_fs2.default.watch(dir, { recursive: true }, (event, filename) => {
         if (!filename) return;
         if (!filename.toLowerCase().endsWith(".md")) return;
         if (filename.startsWith(".")) return;
-        const abs = import_path2.default.resolve(dir, filename);
+        const abs = import_path3.default.resolve(dir, filename);
         if (this._timers[abs]) clearTimeout(this._timers[abs]);
         this._timers[abs] = setTimeout(() => {
           delete this._timers[abs];
           try {
-            import_fs.default.accessSync(abs);
+            import_fs2.default.accessSync(abs);
             this.sync.importFile(abs).catch((e) => this.log("[watcher] import err", e));
           } catch {
             this.sync.deleteFile(abs).catch((e) => this.log("[watcher] delete err", e));
@@ -802,11 +1351,11 @@ var Watcher = class {
   }
 };
 
-// src/commands.js
-var import_path3 = __toESM(require("path"));
+// siyuan-md-sync/src/commands.js
+var import_path4 = __toESM(require("path"));
 var import_siyuan4 = require("siyuan");
 
-// src/picker.js
+// siyuan-md-sync/src/picker.js
 var import_siyuan3 = require("siyuan");
 function inputDialog(title, message, placeholder = "") {
   return new Promise((resolve) => {
@@ -848,7 +1397,7 @@ async function pickFile() {
   return inputDialog(t("pickAFileTitle"), t("pickAFilePrompt"), "/Users/me/notes/foo.md");
 }
 
-// src/commands.js
+// siyuan-md-sync/src/commands.js
 function registerCommands(plugin) {
   const { sync, state } = plugin;
   plugin.addCommand({
@@ -864,7 +1413,7 @@ function registerCommands(plugin) {
       const watched = state.allWatched();
       if (!watched.some((w) => filePath.startsWith(w.folder.path + "/") || filePath === w.folder.path)) {
         const cur = state.ensureActive();
-        cur.folders.push({ path: import_path3.default.dirname(filePath), label: "\u4E34\u65F6" });
+        cur.folders.push({ path: import_path4.default.dirname(filePath), label: "\u4E34\u65F6" });
         await state.save();
         await plugin.stopWatcher();
         plugin.startWatcher();
@@ -945,17 +1494,17 @@ function registerCommands(plugin) {
     langKey: "cmdCleanIal",
     hotkey: "",
     callback: async () => {
-      const fs3 = require("fs/promises");
+      const fs4 = require("fs/promises");
       const crypto2 = require("crypto");
       const sha = (t2) => crypto2.createHash("sha256").update(t2).digest("hex");
       const strip = (txt) => txt.replace(/^[ \t]*\{:[^}]*\}[ \t]*\r?\n?/gm, "").replace(/\{:[^}]*\}/g, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
       let n = 0;
       for (const absPath of state.allPaths()) {
         try {
-          const orig = await fs3.readFile(absPath, "utf-8");
+          const orig = await fs4.readFile(absPath, "utf-8");
           const cleaned = strip(orig);
           if (cleaned !== orig) {
-            await fs3.writeFile(absPath, cleaned, "utf-8");
+            await fs4.writeFile(absPath, cleaned, "utf-8");
             const m = state.get(absPath);
             if (m) m.mdHash = sha(cleaned);
             n++;
@@ -969,7 +1518,7 @@ function registerCommands(plugin) {
   });
 }
 
-// src/index.js
+// siyuan-md-sync/src/index.js
 function inputDialog2(title, message, placeholder = "", defaultValue = "") {
   return new Promise((resolve) => {
     const dialog = new import_siyuan5.Dialog({
@@ -1009,10 +1558,12 @@ var index_default = class extends import_siyuan5.Plugin {
     this.notify = (msg, type) => (0, import_siyuan5.showMessage)(msg, 3e3, type || "info");
     try {
       this.api = new Api();
+      await this.api.initDataDir();
       this.state = new State(this);
       await this.state.load();
       this.notebooks = [];
       await this.refreshNotebooks();
+      await this.validateNotebooks();
       this.sync = new Sync(this.api, this.state, {
         notify: this.notify,
         log: this.log
@@ -1065,6 +1616,7 @@ var index_default = class extends import_siyuan5.Plugin {
           simulateWsEvent: (docId) => this.sync.schedulePull(docId),
           reconcile: () => this.sync.reconcile(),
           dump: () => ({
+            dataDir: this.api.getDataDir(),
             activeNotebookId: this.state.activeNotebookId,
             notebooks: this.state.notebooks,
             mappings: this.state.mappings
@@ -1083,6 +1635,39 @@ var index_default = class extends import_siyuan5.Plugin {
     } catch (e) {
       this.log("refreshNotebooks failed", e);
     }
+  }
+  /**
+   * 清理 state 中已失效的 notebook 配置：
+   * - 比对当前 this.notebooks，找出 state.notebooks 里已不存在（或 closed）的 nbId
+   * - 对每个失效的 nbId 调用 state.removeNotebook，清理所有 instance
+   * - 持久化 + 通知用户
+   */
+  async validateNotebooks() {
+    if (!this.state || !this.notebooks || !this.notebooks.length) return;
+    const liveIds = new Set(this.notebooks.map((n) => n.id));
+    const stale = [];
+    for (const nbId of Object.keys(this.state.notebooks || {})) {
+      if (!liveIds.has(nbId)) stale.push(nbId);
+    }
+    if (!stale.length) return;
+    let totalInstances = 0;
+    const dbg = (m) => {
+      this.log(m);
+      try {
+        require("fs").appendFileSync("/tmp/siyuan-ws-debug.log", `[validate] ${m}
+`);
+      } catch {
+      }
+    };
+    for (const nbId of stale) {
+      const removed = this.state.removeNotebook(nbId);
+      totalInstances += removed;
+      dbg(`validateNotebooks: removed stale config ${nbId} (${removed} instance(s) cleaned)`);
+    }
+    await this.state.save();
+    const msg = stale.length === 1 ? `\u6E05\u7406\u4E86 1 \u4E2A\u5931\u6548\u7684\u7B14\u8BB0\u672C\u914D\u7F6E\uFF08${totalInstances} \u4E2A instance\uFF09` : `\u6E05\u7406\u4E86 ${stale.length} \u4E2A\u5931\u6548\u7684\u7B14\u8BB0\u672C\u914D\u7F6E\uFF08${totalInstances} \u4E2A instance\uFF09`;
+    dbg(msg);
+    this.notify(msg, "info");
   }
   async onunload() {
     try {

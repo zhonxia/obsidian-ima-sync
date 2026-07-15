@@ -216,6 +216,53 @@ export class State {
     delete this.mappings[absPath];
   }
 
+  /**
+   * 移除整个 notebook 配置及其所有 instance。
+   * - 删除 this.notebooks[nbId]
+   * - 清理 mappings 中所有引用该 nbId 的 instance（path 仍保留，孤儿 .md 留给用户处理）
+   * - 若 activeNotebookId 命中，重置为空
+   * @returns {number} 被清理的 mapping 数
+   */
+  removeNotebook(nbId) {
+    if (!nbId) return 0;
+    let removed = 0;
+    for (const [path, m] of Object.entries(this.mappings)) {
+      const before = (m.instances || []).length;
+      m.instances = (m.instances || []).filter(i => i.notebookId !== nbId);
+      if (m.instances.length === 0) {
+        // 所有 instance 都没了，删掉整个 mapping
+        delete this.mappings[path];
+      }
+      removed += before - m.instances.length;
+    }
+    delete this.notebooks[nbId];
+    if (this.activeNotebookId === nbId) this.activeNotebookId = '';
+    return removed;
+  }
+
+  /** 重命名：把映射的 key 从 oldPath 改成 newPath（保留 mdHash 和 instances）。 */
+  renamePath(oldPath, newPath) {
+    if (oldPath === newPath) return;
+    const m = this.mappings[oldPath];
+    if (!m) return;
+    if (this.mappings[newPath]) {
+      // 冲突：合并 instances（去重 by docId）
+      const existing = this.mappings[newPath];
+      const seen = new Set(existing.instances.map(i => `${i.notebookId}::${i.docId}`));
+      for (const inst of m.instances || []) {
+        const k = `${inst.notebookId}::${inst.docId}`;
+        if (!seen.has(k)) {
+          existing.instances.push(inst);
+          seen.add(k);
+        }
+      }
+      delete this.mappings[oldPath];
+    } else {
+      delete this.mappings[oldPath];
+      this.mappings[newPath] = m;
+    }
+  }
+
   /** 按 notebookId 移除该 path 的 instance（用于从笔记本上删除文件夹时）。 */
   removeByNotebook(absPath, notebookId) {
     const m = this.mappings[absPath];
